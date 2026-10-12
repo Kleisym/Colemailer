@@ -19,12 +19,13 @@ _broadcaster = None
 _loop = None
 _is_running = False
 _bridge_lock = threading.Lock()
+_kick_event = None  # asyncio.Event living in _loop; set by kick()
 
 # How often the supervisor checks the connection, and how often it sends a
 # real request to prove the socket is alive (a half-dead socket after doze or
 # a Wi-Fi <-> mobile handover still reports is_connected() == True).
 SUPERVISOR_POLL_SECONDS = 15
-HEALTH_CHECK_SECONDS = 120
+HEALTH_CHECK_SECONDS = 60
 HEALTH_CHECK_TIMEOUT = 25
 
 # Errors that retrying cannot fix: stop and tell the user.
@@ -50,6 +51,24 @@ def is_running():
     return _is_running
 
 
+def kick():
+    """Ask the supervisor for an immediate health check / reconnect.
+
+    Called from Kotlin (any thread) when the network changes or the keep-alive
+    alarm fires, so a socket that died while the phone was dozing is replaced
+    right away instead of after the next poll."""
+    with _bridge_lock:
+        loop = _loop
+        ev = _kick_event
+    if loop is None or ev is None or not _is_running:
+        return False
+    try:
+        loop.call_soon_threadsafe(ev.set)
+        return True
+    except Exception:
+        return False
+
+
 def stop_bot():
     global _client, _broadcaster, _is_running
     with _bridge_lock:
@@ -69,6 +88,9 @@ def stop_bot():
                 broadcaster_to_stop.stop()
             except Exception:
                 pass
+        ev = _kick_event
+        if ev is not None:
+            ev.set()
         if client_to_disconnect:
             asyncio.ensure_future(_safe_disconnect(client_to_disconnect))
 
@@ -128,7 +150,7 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
         flood_sleep_threshold=60,
         device_model="Android",
         system_version="Spambuster",
-        app_version="2.0",
+        app_version="2.1",
     )
 
     with _bridge_lock:
@@ -187,12 +209,31 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
             return False
 
     async def run():
-        global _broadcaster
+        global _broadcaster, _kick_event
         broadcaster = None
+        lock_key = None
+        kick_event = asyncio.Event()
+        with _bridge_lock:
+            _kick_event = kick_event
         try:
             if not await login():
                 return
             me = await client.get_me()
+            # Never run two copies of the bot on one account (a previous run
+            # that is still shutting down would otherwise send duplicates).
+            lock_key = f"acct_{me.id}"
+            waited = 0
+            while not bot.acquire_instance_lock(lock_key):
+                if not _is_running:
+                    lock_key = None
+                    return
+                if waited == 0:
+                    _status(callback, "Ожидание остановки предыдущего запуска...")
+                if waited >= 90:
+                    lock_key = None
+                    raise RuntimeError("этот аккаунт уже запущен в другом процессе")
+                await asyncio.sleep(2)
+                waited += 2
             username = f"@{me.username}" if me.username else (me.first_name or "Пользователь")
             client._self_user = me
 
@@ -222,13 +263,22 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
             last_health = asyncio.get_running_loop().time()
             healthy = True
             while _is_running:
-                await asyncio.wait({client.disconnected}, timeout=SUPERVISOR_POLL_SECONDS)
+                kick_wait = asyncio.ensure_future(kick_event.wait())
+                try:
+                    await asyncio.wait({client.disconnected, kick_wait},
+                                       timeout=SUPERVISOR_POLL_SECONDS,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    if not kick_wait.done():
+                        kick_wait.cancel()
+                kicked = kick_event.is_set()
+                kick_event.clear()
                 if not _is_running:
                     break
 
                 now = asyncio.get_running_loop().time()
                 dead = not client.is_connected()
-                if not dead and now - last_health >= HEALTH_CHECK_SECONDS:
+                if not dead and (kicked or now - last_health >= HEALTH_CHECK_SECONDS):
                     last_health = now
                     dead = not await health_check()
 
@@ -243,6 +293,13 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
                             healthy = True
                             last_health = asyncio.get_running_loop().time()
                             _status(callback, f"Работает ({username})")
+                            # Re-check folders / due tasks after the outage.
+                            try:
+                                broadcaster.request_folder_sync()
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(5)
                     except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                         bot.log_error(f"[SUPERVISOR] Реконнект не удался: {e}")
                         await asyncio.sleep(5)
@@ -255,7 +312,11 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
             with _bridge_lock:
                 if _broadcaster is broadcaster:
                     _broadcaster = None
+                if _kick_event is kick_event:
+                    _kick_event = None
             await _safe_disconnect(client)
+            if lock_key:
+                bot.release_instance_lock(lock_key)
 
     try:
         loop.run_until_complete(run())

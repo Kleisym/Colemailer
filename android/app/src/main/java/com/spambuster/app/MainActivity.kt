@@ -1,6 +1,8 @@
 package com.spambuster.app
 
 import android.Manifest
+import android.app.ActivityManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -21,6 +23,10 @@ import androidx.core.content.ContextCompat
 import com.spambuster.app.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity(), BotBridgeCoordinator.UiListener {
+
+    companion object {
+        private const val KEY_AUTOSTART_HINT_SHOWN = "autostart_hint_shown"
+    }
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: SharedPreferences
@@ -118,6 +124,7 @@ class MainActivity : AppCompatActivity(), BotBridgeCoordinator.UiListener {
             BotBridgeCoordinator.isBotRunning = true
             updateStatusUi()
             Toast.makeText(this, "🚀 Запуск Spambuster...", Toast.LENGTH_SHORT).show()
+            ensureBackgroundAllowed()
         }
 
         binding.btnStop.setOnClickListener {
@@ -135,6 +142,121 @@ class MainActivity : AppCompatActivity(), BotBridgeCoordinator.UiListener {
 
         binding.btnBattery.setOnClickListener {
             requestIgnoreBatteryOptimization()
+        }
+
+        binding.btnAutostart.setOnClickListener {
+            showBackgroundHelp()
+        }
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun isBackgroundRestricted(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        return am.isBackgroundRestricted
+    }
+
+    /**
+     * Without these two permissions Android (and especially MIUI/HyperOS,
+     * EMUI, ColorOS, OneUI) freezes the bot as soon as the app leaves the
+     * screen - exactly the "works only while the app is open" symptom.
+     */
+    private fun ensureBackgroundAllowed() {
+        when {
+            !isIgnoringBatteryOptimizations() -> requestIgnoreBatteryOptimization()
+            isBackgroundRestricted() -> showBackgroundRestrictedDialog()
+            !prefs.getBoolean(KEY_AUTOSTART_HINT_SHOWN, false) -> {
+                prefs.edit().putBoolean(KEY_AUTOSTART_HINT_SHOWN, true).apply()
+                showBackgroundHelp()
+            }
+        }
+    }
+
+    private fun showBackgroundRestrictedDialog() {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("Фоновая работа запрещена")
+            .setMessage("Для Spambuster включено ограничение фоновой работы. Откройте «Батарея» и выберите «Без ограничений», иначе бот работает только пока приложение открыто.")
+            .setPositiveButton("Открыть настройки") { _, _ -> openAppDetails() }
+            .setNegativeButton("Позже", null)
+            .show()
+    }
+
+    private fun showBackgroundHelp() {
+        if (isFinishing || isDestroyed) return
+        val battery = if (isIgnoringBatteryOptimizations()) "✅" else "❌"
+        val restricted = if (isBackgroundRestricted()) "❌" else "✅"
+        val message = """
+            Чтобы бот работал при закрытом приложении и выключенном экране:
+
+            $battery Оптимизация батареи отключена
+            $restricted Фоновая работа не ограничена
+
+            • Xiaomi/Redmi/POCO: Автозапуск — вкл, Контроль активности — «Нет ограничений», в недавних закрепите приложение замком.
+            • Huawei/Honor: Запуск приложений — вручную, включить все 3 переключателя.
+            • Samsung: Батарея — «Без ограничений», убрать из «Спящих приложений».
+            • Oppo/Realme/OnePlus/Vivo: Автозапуск — вкл, разрешить фоновую активность.
+            • Не смахивайте приложение из недавних и не используйте «очистку памяти».
+        """.trimIndent()
+        AlertDialog.Builder(this)
+            .setTitle("Работа в фоне 24/7")
+            .setMessage(message)
+            .setPositiveButton("Автозапуск") { _, _ -> openAutostartSettings() }
+            .setNeutralButton("Батарея") { _, _ ->
+                if (!isIgnoringBatteryOptimizations()) requestIgnoreBatteryOptimization() else openAppDetails()
+            }
+            .setNegativeButton("Закрыть", null)
+            .show()
+    }
+
+    private fun openAutostartSettings() {
+        val candidates = listOf(
+            ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+            ComponentName("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity"),
+            ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"),
+            ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.optimize.process.ProtectActivity"),
+            ComponentName("com.hihonor.systemmanager", "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity"),
+            ComponentName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
+            ComponentName("com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"),
+            ComponentName("com.oplus.safecenter", "com.oplus.safecenter.permission.startup.StartupAppListActivity"),
+            ComponentName("com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"),
+            ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
+            ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"),
+            ComponentName("com.samsung.android.lool", "com.samsung.android.sm.battery.ui.BatteryActivity"),
+            ComponentName("com.samsung.android.sm", "com.samsung.android.sm.ui.battery.BatteryActivity"),
+            ComponentName("com.asus.mobilemanager", "com.asus.mobilemanager.entry.FunctionActivity"),
+            ComponentName("com.letv.android.letvsafe", "com.letv.android.letvsafe.AutobootManageActivity")
+        )
+        for (component in candidates) {
+            val intent = Intent().apply {
+                this.component = component
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            try {
+                // resolveActivity() is blind to other packages on Android 11+
+                // without <queries>, so just try each screen.
+                startActivity(intent)
+                return
+            } catch (e: Exception) {
+                // try the next vendor screen
+            }
+        }
+        Toast.makeText(this, "Откройте «Автозапуск» / «Батарея» для Spambuster вручную", Toast.LENGTH_LONG).show()
+        openAppDetails()
+    }
+
+    private fun openAppDetails() {
+        try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            })
+        } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось открыть настройки", Toast.LENGTH_SHORT).show()
         }
     }
 

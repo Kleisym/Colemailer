@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import time
+import unicodedata
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from telethon import TelegramClient, errors, events, utils
@@ -387,8 +388,32 @@ class Database:
                 cols = [r["name"] for r in cursor.fetchall()]
                 if "account_id" not in cols:
                     cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN account_id INTEGER DEFAULT 0")
+                # retry_at: a failed counter-mode post is re-sent by the timer
+                # after a back-off instead of "on the very next message"
+                # (which ignored the configured message count).
+                if "retry_at" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN retry_at REAL DEFAULT 0")
+                if "fail_count" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN fail_count INTEGER DEFAULT 0")
+                # manual_stop: stopped/removed by the user in ONE chat of a
+                # folder broadcast. The folder sync must not resurrect it.
+                if "manual_stop" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN manual_stop INTEGER DEFAULT 0")
             except Exception:
                 pass
+
+            # Per-chat position inside a named rotation. A single global index
+            # meant that with 2 chats and 2 posts every chat always received
+            # the same post and never rotated.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rotation_progress (
+                    account_id INTEGER DEFAULT 0,
+                    rotation_id INTEGER,
+                    chat_id INTEGER,
+                    current_index INTEGER DEFAULT 0,
+                    PRIMARY KEY (account_id, rotation_id, chat_id)
+                )
+            """)
 
             try:
                 cursor.execute("PRAGMA table_info(chat_rotations)")
@@ -552,7 +577,10 @@ class Database:
                         is_active = 1,
                         folder_name = ?,
                         current_count = 0,
-                        last_sent_at = 0.0
+                        last_sent_at = 0.0,
+                        retry_at = 0,
+                        fail_count = 0,
+                        manual_stop = 0
                     WHERE id = ?
                 """, (account_id, mode, interval_seconds, counter_threshold, folder_name, row["id"]))
             else:
@@ -679,10 +707,13 @@ class Database:
         with self._conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
-                "SELECT id, is_active, mode, interval_seconds, counter_threshold, account_id "
+                "SELECT id, is_active, mode, interval_seconds, counter_threshold, account_id, manual_stop "
                 "FROM broadcast_tasks WHERE chat_id = ? AND template_name = ? AND account_id = ?",
                 (chat_id, clean_name, account_id)
             ).fetchone()
+            if row is not None and row["manual_stop"]:
+                # The user stopped / removed this chat explicitly.
+                return False
             if row is None:
                 cursor.execute(
                     """
@@ -812,6 +843,10 @@ class Database:
                             WHERE id = ?
                         """, (new_count, t["id"]))
                 else:
+                    if (t.get("retry_at") or 0) > 0:
+                        # A failed post is already waiting for its timed retry.
+                        cursor.execute("UPDATE broadcast_tasks SET current_count = ? WHERE id = ?", (new_count, t["id"]))
+                        continue
                     if new_count >= threshold:
                         ready_tasks.append(t)
                         cursor.execute("""
@@ -847,22 +882,78 @@ class Database:
             )
             return cur.rowcount == 1
 
-    def schedule_retry(self, task: Dict[str, Any], delay: float):
-        """Make a claimed-but-unsent task due again after `delay` seconds."""
+    def schedule_retry(self, task: Dict[str, Any], delay: float, failed: bool = True):
+        """
+        Make a claimed-but-unsent task due again after `delay` seconds.
+
+        interval/hybrid: shift last_sent_at so the timer fires after `delay`.
+        counter: set retry_at; the scheduler loop re-sends it then. The old
+        code forced current_count to the threshold, so the post went out on
+        the next message regardless of the configured count / slow mode.
+        """
         mode = task.get("mode") or "interval"
         interval = task.get("interval_seconds") or 0
         threshold = task.get("counter_threshold") or 0
+        delay = max(float(delay), 1.0)
+        now = time.time()
         with self._conn() as conn:
             if mode in ("interval", "hybrid"):
                 conn.execute(
                     "UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?",
-                    (time.time() - interval + max(delay, 1.0), task["id"]),
+                    (now - interval + delay, task["id"]),
                 )
-            if mode in ("counter", "hybrid"):
+            if mode == "hybrid":
                 conn.execute(
                     "UPDATE broadcast_tasks SET current_count = MAX(current_count, ?) WHERE id = ?",
                     (threshold, task["id"]),
                 )
+            if mode == "counter":
+                conn.execute(
+                    "UPDATE broadcast_tasks SET retry_at = ? WHERE id = ?",
+                    (now + delay, task["id"]),
+                )
+            if failed:
+                conn.execute(
+                    "UPDATE broadcast_tasks SET fail_count = COALESCE(fail_count, 0) + 1 WHERE id = ?",
+                    (task["id"],),
+                )
+
+    def get_fail_count(self, task_id: int) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT fail_count FROM broadcast_tasks WHERE id = ?", (task_id,)).fetchone()
+            return int(row["fail_count"] or 0) if row else 0
+
+    def mark_task_sent(self, task_id: int):
+        with self._conn() as conn:
+            conn.execute("UPDATE broadcast_tasks SET fail_count = 0, retry_at = 0 WHERE id = ?", (task_id,))
+
+    def get_due_retries(self, account_id: int = 0, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        now = time.time() if now is None else now
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM broadcast_tasks WHERE is_active = 1 AND mode = 'counter' "
+                "AND retry_at > 0 AND retry_at <= ? AND (account_id = ? OR ? = 0)",
+                (now, account_id, account_id),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def next_retry_at(self, account_id: int = 0) -> Optional[float]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MIN(retry_at) AS t FROM broadcast_tasks WHERE is_active = 1 AND mode = 'counter' "
+                "AND retry_at > 0 AND (account_id = ? OR ? = 0)",
+                (account_id, account_id),
+            ).fetchone()
+            return float(row["t"]) if row and row["t"] else None
+
+    def claim_retry(self, task_id: int, now: float) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE broadcast_tasks SET retry_at = 0, current_count = 0, last_sent_at = ? "
+                "WHERE id = ? AND is_active = 1 AND retry_at > 0 AND retry_at <= ?",
+                (now, task_id, now),
+            )
+            return cur.rowcount == 1
 
     def deactivate_task(self, task_id: int):
         with self._conn() as conn:
@@ -919,6 +1010,104 @@ class Database:
                 """, (clean_name, f"<{clean_name}>"))
             row = cursor.fetchone()
             return row["cnt"] if row else 0
+
+    # ---- user-facing stop / resume / delete with an explicit scope ---------
+    @staticmethod
+    def _scope_sql(account_id: int, name: Optional[str], chat_ids: Optional[List[int]], folder_name: Optional[str]):
+        conds: List[str] = []
+        params: List[Any] = []
+        if account_id:
+            conds.append("(account_id = ? OR account_id = 0)")
+            params.append(account_id)
+        if name and name.lower() not in ("все", "all"):
+            clean = name.strip("<>").strip()
+            conds.append("(template_name = ? OR template_name = ?)")
+            params.extend([clean, f"<{clean}>"])
+        sub: List[str] = []
+        if folder_name:
+            sub.append("folder_name = ?")
+            params.append(folder_name)
+        if chat_ids:
+            sub.append(f"chat_id IN ({','.join('?' for _ in chat_ids)})")
+            params.extend(chat_ids)
+        if sub:
+            conds.append(f"({' OR '.join(sub)})")
+        return (" WHERE " + " AND ".join(conds)) if conds else "", params
+
+    def stop_tasks(self, account_id: int = 0, name: Optional[str] = None, chat_ids: Optional[List[int]] = None,
+                   folder_name: Optional[str] = None, manual: bool = False) -> int:
+        where, params = self._scope_sql(account_id, name, chat_ids, folder_name)
+        with self._conn() as conn:
+            cur = conn.execute(f"UPDATE broadcast_tasks SET is_active = 0, manual_stop = ?{where}", [1 if manual else 0] + params)
+            return cur.rowcount
+
+    def resume_tasks(self, account_id: int = 0, name: Optional[str] = None, chat_ids: Optional[List[int]] = None,
+                     folder_name: Optional[str] = None) -> int:
+        """
+        Direct (non-folder) tasks are re-enabled immediately. Folder tasks only
+        lose their manual stop: the folder sync re-enables the ones whose chat
+        is still in the folder, so chats that left it stay off.
+        """
+        where, params = self._scope_sql(account_id, name, chat_ids, folder_name)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE broadcast_tasks SET manual_stop = 0, retry_at = 0, fail_count = 0, "
+                "is_active = CASE WHEN folder_name IS NULL OR folder_name = '' THEN 1 ELSE is_active END" + where,
+                params,
+            )
+            return cur.rowcount
+
+    def delete_tasks(self, account_id: int = 0, name: Optional[str] = None, chat_ids: Optional[List[int]] = None,
+                     folder_name: Optional[str] = None, keep_folder_tombstones: bool = False) -> int:
+        """
+        Delete tasks. With keep_folder_tombstones (deleting in ONE chat of a
+        folder broadcast) folder rows are kept as manual-stop tombstones so the
+        folder sync does not re-create them a minute later.
+        """
+        where, params = self._scope_sql(account_id, name, chat_ids, folder_name)
+        with self._conn() as conn:
+            if keep_folder_tombstones:
+                n1 = conn.execute(
+                    "UPDATE broadcast_tasks SET is_active = 0, manual_stop = 1" + where +
+                    (" AND " if where else " WHERE ") + "folder_name IS NOT NULL AND folder_name != ''",
+                    params,
+                ).rowcount
+                n2 = conn.execute(
+                    "DELETE FROM broadcast_tasks" + where +
+                    (" AND " if where else " WHERE ") + "(folder_name IS NULL OR folder_name = '')",
+                    params,
+                ).rowcount
+                return n1 + n2
+            return conn.execute("DELETE FROM broadcast_tasks" + where, params).rowcount
+
+    def list_all_tasks(self, account_id: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            if account_id:
+                rows = conn.execute(
+                    "SELECT * FROM broadcast_tasks WHERE (account_id = ? OR account_id = 0) ORDER BY template_name, chat_id",
+                    (account_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM broadcast_tasks ORDER BY template_name, chat_id").fetchall()
+            return [dict(r) for r in rows]
+
+    def list_folder_broadcasts(self, account_id: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            if account_id:
+                rows = conn.execute("SELECT * FROM folder_broadcasts WHERE account_id = ? OR account_id = 0", (account_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM folder_broadcasts").fetchall()
+            return [dict(r) for r in rows]
+
+    def count_live_tasks_for_template(self, template_name: str) -> int:
+        """Tasks (any account) that still use a template, tombstones excluded."""
+        clean = template_name.strip("<>").strip()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM broadcast_tasks WHERE (template_name = ? OR template_name = ?) AND COALESCE(manual_stop, 0) = 0",
+                (clean, f"<{clean}>"),
+            ).fetchone()
+            return int(row["c"]) if row else 0
 
     def set_broadcast_status(
         self,
@@ -1185,10 +1374,26 @@ class Database:
                 "is_active": row["is_active"]
             }
 
-    def get_next_rotation_template(self, chat_id: Optional[int] = None, account_id: int = 0, rotation_name: Optional[str] = None) -> Optional[str]:
+    def get_next_rotation_template(
+        self,
+        chat_id: Optional[int] = None,
+        account_id: int = 0,
+        rotation_name: Optional[str] = None,
+        member_of_chat_rotation: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Next post of a rotation, advancing the position.
+
+        rotation_name: a named rotation; its position is tracked PER CHAT.
+        Otherwise the chat's own (unnamed) rotation is used, but only when
+        `member_of_chat_rotation` is None or is one of the rotated posts. That
+        stops an old chat rotation from hijacking every unrelated broadcast in
+        the chat (which looked like a "phantom" post being sent).
+        """
         with self._conn() as conn:
             cursor = conn.cursor()
             row = None
+            named = False
             if rotation_name:
                 clean_rot = rotation_name.strip("<>").strip()
                 if account_id:
@@ -1196,6 +1401,7 @@ class Database:
                 else:
                     cursor.execute("SELECT * FROM chat_rotations WHERE (name = ? OR name = ?) AND is_active = 1", (clean_rot, f"<{clean_rot}>"))
                 row = cursor.fetchone()
+                named = row is not None
 
             if not row and chat_id is not None:
                 if account_id:
@@ -1203,6 +1409,10 @@ class Database:
                 else:
                     cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND is_active = 1", (chat_id,))
                 row = cursor.fetchone()
+                if row is not None and member_of_chat_rotation is not None:
+                    names_chk = [n.strip("<>").strip() for n in (json.loads(row["template_names"]) if row["template_names"] else [])]
+                    if member_of_chat_rotation.strip("<>").strip() not in names_chk:
+                        return None
 
             if not row:
                 return None
@@ -1223,6 +1433,20 @@ class Database:
 
             if len(valid_names) != len(names):
                 cursor.execute("UPDATE chat_rotations SET template_names = ? WHERE id = ?", (json.dumps(valid_names), row["id"]))
+
+            if named and chat_id is not None:
+                prog = cursor.execute(
+                    "SELECT current_index FROM rotation_progress WHERE account_id = ? AND rotation_id = ? AND chat_id = ?",
+                    (account_id, row["id"], chat_id),
+                ).fetchone()
+                cur_idx = int(prog["current_index"]) if prog else 0
+                idx = cur_idx % len(valid_names)
+                cursor.execute(
+                    "INSERT INTO rotation_progress (account_id, rotation_id, chat_id, current_index) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(account_id, rotation_id, chat_id) DO UPDATE SET current_index = excluded.current_index",
+                    (account_id, row["id"], chat_id, (idx + 1) % len(valid_names)),
+                )
+                return valid_names[idx]
 
             idx = row["current_index"] % len(valid_names)
             template_name = valid_names[idx]
@@ -1388,9 +1612,14 @@ def is_peer_muted(account_id: int, peer_id: Any, chat_id: Optional[int] = None) 
 
 SPAM_THRESHOLD = 50
 
+# Usernames (lower-case, without @) of every account running in this process.
+# A message that pings us through one of these is a *visible* ping; any other
+# @handle in an advertisement is a foreign contact routing signal.
+OWN_USERNAMES: Set[str] = set()
+
 # Invisible characters used for ghost pings. ZWJ (\u200d) and variation
 # selectors are deliberately NOT here: they are part of normal emoji.
-_INVISIBLE_RE = re.compile(r"[\u200b\u200e\u200f\u2060-\u2064\u2066-\u206f\ufeff\u180e\u3164\u115f\u1160]")
+_INVISIBLE_RE = re.compile(r"[\u200b\u200e\u200f\u2060-\u2064\u2066-\u206f\ufeff\u180e\u3164\u115f\u1160\u2800]")
 
 SPAM_SIGNATURES = [
     # Autoposter / userbot watermarks
@@ -1406,18 +1635,97 @@ SPAM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SPAM_SIGNATURES]
 COUNTRY_FLAGS = ["🇺🇸", "🇮🇳", "🇮🇩", "🇨🇴", "🇲🇲", "🇧🇩", "🇧🇷", "🇨🇦", "🇲🇽", "🇹🇷", "🇨🇱", "🇿🇦", "🇷🇺",
                  "🇺🇦", "🇰🇿", "🇧🇾", "🇺🇿", "🇬🇧", "🇩🇪", "🇵🇭", "🇻🇳", "🇳🇬", "🇵🇰", "🇪🇬"]
 
-# (pattern, points, label). Topics that are almost only ever spam in PR chats.
+# ---------------------------------------------------------------------------
+# Text normalisation. Spammers dodge filters with look-alike Latin letters
+# ("зaрaбoтoк"), fancy Unicode fonts ("𝐙𝐚𝐫𝐚𝐛𝐨𝐭𝐨𝐤") and separators between
+# letters ("з.в.е.з.д.ы"). Everything is folded back before matching and the
+# obfuscation itself is scored, because real people never type like that.
+# ---------------------------------------------------------------------------
+_HOMOGLYPHS_LAT_TO_CYR = str.maketrans({
+    "a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у",
+    "k": "к", "m": "м", "t": "т", "h": "н", "b": "в", "u": "и", "n": "п",
+    "3": "з", "0": "о", "6": "б",
+})
+_FANCY_RANGES = ((0x1D400, 0x1D7FF), (0xFF01, 0xFF5E), (0x24B6, 0x24E9), (0x1F130, 0x1F189))
+_CYR_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+_LAT_RE = re.compile(r"[a-z]", re.IGNORECASE)
+_MASK_RE = re.compile(r"(?:https?://\S+|t\.me/\S+|telegram\.me/\S+|@[a-z0-9_]{3,32})", re.IGNORECASE)
+_SPACED_RE = re.compile(r"(?<![\w])(?:[а-яёa-z][\.\-_*•|·~/\\]{1,2}){3,}[а-яёa-z](?![\w])", re.IGNORECASE)
+_SPACED_WS_RE = re.compile(r"(?<![\w])(?:[а-яё] ){4,}[а-яё](?![\w])", re.IGNORECASE)
+_WORD_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
+
+
+def normalize_text(text: str) -> Tuple[str, Set[str]]:
+    """Lower-cased, de-obfuscated text plus the set of obfuscation tricks seen."""
+    import unicodedata
+    flags: Set[str] = set()
+    if not text:
+        return "", flags
+    if any(lo <= ord(ch) <= hi for ch in text for lo, hi in _FANCY_RANGES):
+        flags.add("fancy_font")
+    t = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
+
+    def _collapse(m: "re.Match") -> str:
+        flags.add("spaced_letters")
+        return re.sub(r"[\s\.\-_*•|·~/\\]", "", m.group(0))
+
+    t = _SPACED_RE.sub(_collapse, t)
+    t = _SPACED_WS_RE.sub(_collapse, t)
+
+    # Fold look-alike Latin letters inside Cyrillic words (links and @handles
+    # are left alone, they are legitimately Latin).
+    out: List[str] = []
+    pos = 0
+    for m in _MASK_RE.finditer(t):
+        out.append(_fold_words(t[pos:m.start()], flags))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_fold_words(t[pos:], flags))
+    return "".join(out), flags
+
+
+def _fold_words(chunk: str, flags: Set[str]) -> str:
+    def _fold(m: "re.Match") -> str:
+        w = m.group(0)
+        cyr = len(_CYR_RE.findall(w))
+        if cyr >= 2 and (_LAT_RE.search(w) or re.search(r"[а-я][036]+[а-я]", w)):
+            flags.add("mixed_script")
+            return w.translate(_HOMOGLYPHS_LAT_TO_CYR)
+        return w
+    return _WORD_RE.sub(_fold, chunk)
+
+
+# (pattern, points, label). Topics that are almost only ever spam when a
+# stranger pings you with them in a PR / ad-exchange chat.
 _SPAM_LEXICON = [
-    (r"зв[её]зд\w*|\bstars?\b", 20, "stars"),
-    (r"\bтон\w{0,2}\b|\bton\b|\busdt\b|\bbtc\b|крипт\w*|\bкрипта\b|\bp2p\b|обменник\w*", 20, "crypto"),
-    (r"\bнфт\b|\bnft\b|подар(?:ок|ки|ков)\b|флор\w*", 20, "nft_gifts"),
+    (r"\bзвезд\w*|\bstars?\b|\bzvezd\w*", 20, "stars"),
+    (r"\bтон\w{0,2}\b|\bton\b|\busdt\b|\bbtc\b|\beth\b|крипт\w*|\bp2p\b|обменник\w*|биткоин\w*|\bbitcoin\w*|"
+     r"\bcrypto\w*|\bairdrop\w*|\bтокен\w*|\btokens?\b", 20, "crypto"),
+    (r"\bнфт\b|\bnft\w*|подар(?:ок|ки|ков|ками|ке|очки)\b|\bфлор\w*|\bgifts?\b", 20, "nft_gifts"),
     (r"\bголд\w*|\bgold\b|\bюс\b|\bробукс\w*|\bгемы\b|\bдонат\w*", 15, "game_currency"),
-    (r"аккаунт\w*|\bакк[иа]?\b|\bакков\b|\bсессии\b|\btdata\b|номер(?:а|ов)\s+(?:стран|рф|сша)|смен\w*\s+номер\w*", 20, "accounts"),
-    (r"заработ\w*|зарабат\w*|работа\s+с\s+телефона|\bдоход\w*|пассивн\w*|без\s+вложени\w*|\bв\s+день\b|\bв\s+сутки\b|\$\s*в\s+(?:день|неделю)|удал[её]нн?\w*\s+работ\w*|\bподработк\w*|набор\s+в\s+команду|ищем\s+людей|\bсхем[ауы]\b|\bарбитраж\w*", 35, "earnings"),
-    (r"казино|\bcasino\b|гемблинг|\bazart\b|\b1win\b|\bstake\b|ставк[иа]\b|фриспин\w*|\bбонус\w*\s+(?:за|при)\s+регистрац\w*|промокод\w*", 35, "gambling"),
-    (r"\bинтим\w*|\b18\s*\+|\bэро\b|\bслив\w*|\bприват\w*\s+канал", 35, "adult"),
+    (r"аккаунт\w*|\bакк(?:и|а|ов)?\b|\bсессии\b|\btdata\b|номер(?:а|ов)\s+(?:стран|рф|сша|для)|смен\w*\s+номер\w*|"
+     r"виртуальн\w*\s+номер\w*|\bпремиум\w*|\bpremium\b|\bпремк\w*|\bбуст(?:ы|ов|а|ами)?\b|\bboosts?\b|"
+     r"\bюз(?:ы|ов|ер\w*|ернейм\w*)?\b|\busernames?\b", 20, "tg_goods"),
+    (r"заработ\w*|зарабат\w*|\bдоход\w*|пассивн\w*|без\s+вложени\w*|вложени\w*\s+от|подработк\w*|"
+     r"удаленн\w*\s+работ\w*|работ\w*\s+(?:удаленно|на\s+дому|с\s+телефона|онлайн|для\s+(?:подростков|школьников|студентов|всех))|"
+     r"\bвакансии\b|\bвакансия\b|\bтребу(?:ю|е)тся\b|\bнужны\s+(?:люди|работники|сотрудники|ребята|девушки)|"
+     r"\bнужен\s+(?:человек|работник|сотрудник)|ищ(?:у|ем)\s+(?:людей|сотрудник\w*|работник\w*|партнер\w*|админ\w*|менеджер\w*)|"
+     r"набор\s+в\s+команду|в\s+(?:нашу|свою)\s+команду|\bкурьер\w*|оплата\s+(?:каждый\s+день|ежедневн\w*|сразу|от\s+\d)|"
+     r"высок\w*\s+оплат\w*|легк\w*\s+(?:деньг\w*|работ\w*|заработ\w*)|\bпрофит\w*|инвест\w*|\bearn\w*|\bprofit\w*|"
+     r"\binvest\w*|\bincome\b|\bdaily\b|\bzarab[oa]t\w*|\bdohod\w*|\bсхем[ауы]\b|\bарбитраж\w*|\$\s*в\s+(?:день|неделю)|\bв\s+(?:день|сутки)\s+от\b", 35, "earnings"),
+    (r"казино|\bcasino\b|\bkazino\b|\bказик\w*|гемблинг|\bazart\b|\b1win\b|\bstake\b|ставк[иа]\b|фриспин\w*|"
+     r"\bбонус\w*\s+(?:за|при)\s+регистрац\w*|промокод\w*|\bслоты\b|\bbet\b|\bбеттинг\w*", 35, "gambling"),
+    (r"\bинтим\w*|\b18\s*\+|\bэро\b|\bслив\w*|\bприват\w*\s+канал|\bonlyfans\b|\bнюдс\w*|\bnudes?\b", 35, "adult"),
     (r"\bклик(?:и|ов)\b|\bпросмотр(?:ы|ов)\b\s+(?:на|для)|\bнакрутк\w*|\bподписчик(?:и|ов)\b\s+(?:на|в|для)|\bреакци(?:и|й)\b\s+на", 20, "smm"),
     (r"\bвербовк\w*|\bдроп\w*\b|\bобнал\w*|\bкарты?\s+(?:физ|юр)", 30, "fraud"),
+    (r"выиграл\w*|\bприз\w*|розыгрыш\w*|халяв\w*|\bраздач\w*|\bраздаю\b|бесплатн\w*|\bgiveaway\w*|\bfree\b|\bбонус\w*", 25, "prize"),
+    (r"пиар\w*\s+в\s+\d+|\b\d+\s+чат(?:ах|ов|а)\b|прода(?:м|ю)\s+рекламу\s+в\s+(?:чат|канал|\d)|реклам\w*\s+в\s+(?:моих|наших|\d+)\s+(?:чат|канал)\w*|"
+     r"взаимн\w*\s+пиар\w*|\bвп\b|\bвзаимк\w*|рассылк\w*\s+по\s+(?:чатам|лс|базе)|\bинвайт\w*", 25, "ad_services"),
+    (r"делаю\s+(?:ботов|бота|сайт\w*|дизайн\w*|аватар\w*|аву|логотип\w*|монтаж\w*|рекламу)|на\s+заказ\b|\bуслуг\w*|"
+     r"помогу\s+с\b|разработ\w*\s+(?:бот|сайт)\w*", 20, "services"),
+    (r"\b(?:мой|мою|моего|мои|наш|нашу|нашего|наши)\s+(?:канал\w*|чат\w*|бот\w*|магазин\w*|проект\w*|групп\w*|сообществ\w*|паблик\w*)|"
+     r"\bподпис(?:ывайся|ывайтесь|ись|итесь)\b|\bзаход(?:и|ите)\b|\bвступ(?:ай|айте)\b|\bзалета(?:й|йте)\b|"
+     r"\bjoin\s+(?:my|our|us)\b|\bsubscribe\b", 25, "self_promo"),
 ]
 _SPAM_LEXICON = [(re.compile(p, re.IGNORECASE), pts, label) for p, pts, label in _SPAM_LEXICON]
 _STRONG_TOPICS = {"earnings", "gambling", "adult", "fraud"}
@@ -1427,47 +1735,57 @@ _PROMO_RE = re.compile(
 )
 
 _SALE_VERB_RE = re.compile(
-    r"\b(?:продам|продаю|прода[её]тся|прода[её]м|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|"
-    r"сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|раздаю|раздача|ищу\s+менеджер\w*|"
-    r"менеджер\w*\s+по\s+продажам|дешевле|дешево|дёшево|выгодно|недорого|по\s+курсу|ниже\s+рынка|"
-    r"купить\s+можно|можно\s+купить\s+за|в\s+наличии|цена\s+за|прайс\s*:|оплата\s+(?:в|через|картой|криптой|зв[её]здами))\b",
+    r"\b(?:продам|продаю|продается|продаем|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|"
+    r"сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|отдаю|дарю|раздаю|раздача|делаю|помогу|ищу\s+менеджер\w*|"
+    r"ищ(?:у|ем)\s+(?:партнер\w*|админ\w*|людей|сотрудник\w*|работник\w*)|требу(?:ю|е)тся|нужны\s+люди|нужен\s+человек|"
+    r"переход(?:и|ите)|глян(?:ь|ьте)\s+(?:мой|мою|наш|нашу|канал)|загляни\w*|обращайтесь|"
+    r"менеджер\w*\s+по\s+продажам|дешевле|дешево|выгодно|недорого|по\s+курсу|ниже\s+рынка|"
+    r"купить\s+можно|можно\s+купить\s+за|в\s+наличии|цена\s+за|прайс\s*:|оплата\s+(?:в|через|картой|криптой)\s|"
+    r"sell\w*|buy\w*|cheap\w*)\b",
     re.IGNORECASE,
 )
 _SELLER_ASK_RE = re.compile(
-    r"\b(?:купишь|купите|покупайте|покупай|закажи|заказывай|нужн[ыао]\s+(?:зв[её]зд|акк|подписчик|просмотр|клик|реклам))",
+    r"\b(?:купишь|купите|покупайте|покупай|закажи|заказывай|нужн[ыао]\s+(?:звезд|акк|подписчик|просмотр|клик|реклам|бусты|премиум)|"
+    r"хочешь\s+(?:заработать|зарабатывать|звезд|бесплатн|подарок|подарки|премиум)|хотите\s+(?:заработать|зарабатывать))",
     re.IGNORECASE,
 )
 _ROUTING_RE = re.compile(
-    r"(?:пиш(?:и|ите)|писать|связь|обращаться|отпиш(?:и|ите)|стучи(?:те)?|жду|вопросы|заказ|менеджер\w*|"
-    r"по\s+поводу\s+\w+|для\s+заказа|купить)\s*(?:в\s+лс|в\s+личку|в\s+пм|сюда|тут)?\s*[:\-—–]?\s*@\w+",
+    r"(?:пиш(?:и|ите)|писать|связь|обращаться|отпиш(?:и|ите)|стучи(?:те)?|жду|вопросы|заказ|менеджер\w*|contact|"
+    r"по\s+поводу\s+\w+|для\s+заказа|купить)\s*(?:в\s+лс|в\s+личку|в\s+пм|сюда|тут|мне)?\s*[:\-—–]?\s*@\w+",
     re.IGNORECASE,
 )
 _EMOJI_ROUTING_RE = re.compile(r"(?:📩|👉|📲|💬|✍️|✍|✉️|☎️|📞|➡️|⬇️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+", re.IGNORECASE)
 _DM_CTA_RE = re.compile(
-    r"(?:\bв\s+лс\b|\bв\s+личку\b|\bв\s+пм\b|\bлс\s+открыт\w*|подробн\w*\s+(?:в|по)\s+(?:лс|профил\w*|био|ссылк\w*|канал\w*)|"
-    r"ссылка\s+в\s+(?:профиле|био|описании)|жми\s+на|переходи\w*|\bтык\b)",
+    r"(?:\bв\s+лс\b|\bв\s+личк\w*|\bв\s+пм\b|\bлс\s+открыт\w*|\bлс\b|\bпиш(?:и|ите)\b|\bнапиш(?:и|ите)\b|\bотпиш(?:и|ите)\w*|"
+    r"\bстуч(?:и|ите)\b|подробн\w*|ссылка\s+в\s+(?:профиле|био|описании)|\bв\s+профил\w*|\bв\s+био\b|\bпо\s+ссылке\b|"
+    r"жми\b|переходи\w*|\bтык\b|\bdm\b|\bpm\b|\bwrite\s+me\b|\bcontact\b|\bclaim\b)",
     re.IGNORECASE,
 )
 _CATALOG_BULLET_RE = re.compile(r"^(?:[·•▪️▫️◾◽\-\—\*✅✔️☑️🔹🔸🔵🟢❗️❕]|\d+[\.\)\-\—]|[1-9]️⃣|[①-⑩])\s*")
 _BANNER_RE = re.compile(r"^(?:🔥|⚡️|⚡|📢|📣|💎|💰|💸|💵|🚀|🚨|❗️|‼️|⚠️|⭐️|⭐|🌟|💥|🎯|👉|📩|📲|💬|🎁|🤑|📈|🆕|🔝)")
-_PRICE_RE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:₽|руб\w*|р\b|\$|usd\w*|€|грн|тг|⭐|🌟|зв[её]зд\w*|ton\b|тон\b)", re.IGNORECASE)
+_PRICE_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:₽|руб\w*|р\b|\$|usd\w*|€|грн|тг|⭐|🌟|звезд\w*|ton\b|тон\b)|\$\s*\d+",
+    re.IGNORECASE,
+)
 _LINK_RE = re.compile(r"t\.me/(?:\+|joinchat/|[a-z0-9_]{5,})|telegram\.me/|https?://\S+", re.IGNORECASE)
-_PRIVATE_LINK_RE = re.compile(r"t\.me/(?:\+|joinchat/)", re.IGNORECASE)
+_PRIVATE_LINK_RE = re.compile(r"t\.me/(?:\+|joinchat/)|t\.me/[a-z0-9_]*bot\b|\?start=", re.IGNORECASE)
+_HANDLE_RE = re.compile(r"(?<![\w@])@([a-zA-Z0-9_]{4,32})")
 _CONVO_RE = re.compile(
-    r"\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|твой|твоем|твоём|привет|ку|здравствуйте|спасибо|спс|лол|хах\w*|хд|"
-    r"ладно|норм|почему|зачем|окей|ок|понял\w*|сорри|извини\w*|ага|угу|да|нет)\b",
+    r"\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|твой|твоем|привет|ку|здравствуйте|спасибо|спс|лол|хах\w*|хд|"
+    r"ладно|норм|почему|зачем|окей|ок|понял\w*|сорри|извини\w*|ага|угу|да|нет|тоже)\b",
     re.IGNORECASE,
 )
 
 BUYER_QUESTION_TRIGGERS = [
-    r"\bпоч[её]м\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
+    r"\bпочем\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
     r"\bсвободн\w*\b", r"\bстат[уа]\b", r"\bстатистик[ау]\b", r"\bохват\w*\b",
     r"\bчекни\s+лс\b", r"\bответь(?:те)?\s+в\s+лс\b", r"\bкуплю\s+рекламу\b", r"\bхочу\s+купить\b",
-    r"\bпродашь\b", r"\bпрода[её]шь\b", r"\bпрода[её]те\b", r"\bсколько\s+стоит\b",
+    r"\bпродашь\b", r"\bпродаешь\b", r"\bпродаете\b", r"\bсколько\s+стоит\b",
     r"\bможно\s+(?:купить|взять|разместить|заказать)\b", r"\bместо\s+есть\b", r"\bесть\s+место\b",
     r"\bзакреп\w*\b", r"\bслот\w*\b",
 ]
 BUYER_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BUYER_QUESTION_TRIGGERS]
+_BUYER_PURCHASE_RE = re.compile(r"\b(?:куплю|купить|покупаю|возьму)\s+(?:у\s+тебя\s+|у\s+вас\s+)?(?:рекламу|пост\w*|закреп\w*|место|слот\w*|размещени\w*)", re.IGNORECASE)
 
 GATEKEEPER_TRIGGERS = [
     r"чтобы\s+(?:писать|отправлять\s+сообщения)\s+в\s+(?:чат|группу)",
@@ -1544,8 +1862,21 @@ def _hard_evidence(text: str, message: Any = None) -> Optional[Tuple[str, str]]:
     return None
 
 
-def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List[str]]:
-    """Returns (score, primary_trigger, matched_factors). Spam when score >= 50."""
+def _strip_mentions(text: str) -> str:
+    return re.sub(r"@[A-Za-z0-9_]{3,32}", " ", text or "").strip()
+
+
+def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str] = None) -> Tuple[int, str, List[str]]:
+    """
+    Returns (score, primary_trigger, matched_factors). Spam when score >= 50.
+
+    ping_kind describes how the message reached us: "reply" (reply to our
+    message), "username" (our @handle typed in the text), "name" (a regular
+    mention of our name), "stealth" (Telegram flagged it as a mention but it
+    is neither a reply nor a visible mention: a hidden tag) or None.
+    """
+    if ping_kind == "stealth":
+        return 100, "stealth_ping", ["hidden_mention_without_username_or_reply"]
     if not text:
         if message is not None and getattr(message, "via_bot_id", None):
             return 100, "sent_via_inline_bot", ["inline_bot"]
@@ -1555,7 +1886,7 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
     if hard:
         return 100, hard[0], [hard[1]]
 
-    clean = text.lower()
+    clean, obf = normalize_text(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     factors: List[str] = []
     score = 0
@@ -1565,14 +1896,24 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
         score += points
         factors.append(f"{label}(+{points})")
 
+    # --- obfuscation: people do not type like this ---------------------------
+    if "mixed_script" in obf:
+        add(30, "lookalike_letters")
+    if "fancy_font" in obf:
+        add(25, "fancy_unicode_font")
+    if "spaced_letters" in obf:
+        add(25, "spaced_out_letters")
+
     # --- commercial lexicon -------------------------------------------------
     topic_points = 0
     strong_topic = False
     multi_hit_topic = False
+    topics: Set[str] = set()
     for pat, pts, label in _SPAM_LEXICON:
         hits = {m.group(0) for m in pat.finditer(clean)}
         if not hits:
             continue
+        topics.add(label)
         if label in _STRONG_TOPICS:
             strong_topic = True
         extra = min(10 * (len(hits) - 1), 20)
@@ -1580,10 +1921,13 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
             multi_hit_topic = True
         topic_points += pts + extra
         factors.append(f"topic_{label}(+{pts + extra})")
-    topic_points = min(topic_points, 50)
+    topic_points = min(topic_points, 60)
     score += topic_points
+    if len(topics) >= 2:
+        multi_hit_topic = True
 
-    has_sale_verb = bool(_SALE_VERB_RE.search(clean))
+    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(clean))
+    has_sale_verb = bool(_SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", clean)))
     has_seller_ask = bool(_SELLER_ASK_RE.search(clean))
     if has_sale_verb:
         add(25, "sale_verb")
@@ -1591,22 +1935,26 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
         add(55, "seller_ask")
 
     # --- contact routing ----------------------------------------------------
+    own = {u.lower() for u in OWN_USERNAMES}
+    foreign_handles = [h for h in _HANDLE_RE.findall(text) if h.lower() not in own]
     has_emoji_routing = bool(_EMOJI_ROUTING_RE.search(clean))
-    has_text_routing = bool(_ROUTING_RE.search(clean))
+    has_text_routing = bool(_ROUTING_RE.search(clean)) and bool(foreign_handles)
     has_dm_cta = bool(_DM_CTA_RE.search(clean))
+    commercial_core = bool(topic_points or has_sale_verb or has_seller_ask)
     if has_emoji_routing:
         add(30, "emoji_contact_routing")
     elif has_text_routing:
         add(25, "text_seller_routing")
-    if has_dm_cta and (topic_points or has_sale_verb or has_seller_ask):
-        add(15, "dm_call_to_action")
+    if has_dm_cta and commercial_core:
+        add(20, "dm_call_to_action")
 
     links = _LINK_RE.findall(clean)
     if links:
         add(25 if _PRIVATE_LINK_RE.search(clean) else 10, "promo_links")
-    handles = re.findall(r"@([a-zA-Z0-9_]{4,32})", text)
-    if len(handles) >= 2:
-        add(15, f"multiple_usernames_{len(handles)}")
+    if foreign_handles and commercial_core and not has_text_routing and not has_emoji_routing:
+        add(15, "foreign_handle")
+    if len(foreign_handles) >= 2:
+        add(15, f"multiple_usernames_{len(foreign_handles)}")
 
     prices = _PRICE_RE.findall(clean)
     if len(prices) >= 2:
@@ -1630,14 +1978,17 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
     if re.search(r"\b(?:канал[ыа]?|чат[ыа]?|групп[уыа]|сетк[уи]|баз[уы])\b", clean) and has_sale_verb:
         add(15, "asset_specifiers")
 
-    commercial = bool(topic_points or has_sale_verb or has_seller_ask or has_emoji_routing or has_text_routing)
+    commercial = bool(commercial_core or has_emoji_routing or has_text_routing)
     has_promo = bool(_PROMO_RE.search(clean))
     combo = bool(topic_points) and (
         has_sale_verb or has_seller_ask or has_emoji_routing or has_text_routing or has_dm_cta
-        or bool(links) or bool(prices) or has_promo or (strong_topic and multi_hit_topic)
+        or bool(links) or bool(prices) or has_promo or bool(foreign_handles) or bool(obf)
+        or (strong_topic and multi_hit_topic) or len(topics) >= 2
     )
     if combo:
         add(20, "commercial_combo")
+    elif has_sale_verb and (has_dm_cta or links or foreign_handles):
+        add(15, "offer_with_contact")
 
     # --- conversational dampeners (capped, never cancel commerce) ----------
     damp = 0
@@ -1650,7 +2001,7 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
     if _CONVO_RE.search(clean) and not (has_emoji_routing or bullets):
         damp += 15
         factors.append("conversational_markers(-15)")
-    if has_seller_ask or combo:
+    if has_seller_ask or combo or obf:
         cap = 0
     elif strong_topic:
         cap = 10
@@ -1667,21 +2018,30 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
     return score, (factors[0] if factors else "low_score"), factors
 
 
-def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
-    score, trigger, _ = calculate_spam_score(text or "", message)
+def is_spam_message(text: str, message: Any = None, ping_kind: Optional[str] = None) -> Tuple[bool, str]:
+    score, trigger, _ = calculate_spam_score(text or "", message, ping_kind=ping_kind)
     if score >= SPAM_THRESHOLD:
         return True, f"{trigger} (score={score})"
     return False, ""
+
+
+_BUYER_BLOCKING_TOPICS = {"earnings", "gambling", "adult", "fraud", "prize", "self_promo", "services", "crypto", "nft_gifts", "tg_goods"}
 
 
 def is_genuine_buyer_question(text: str) -> bool:
     """A short question from someone who wants to BUY from us. Never spam."""
     if not text:
         return False
-    clean = text.lower().strip()
-    if len(clean) >= 220 or _INVISIBLE_RE.search(text):
+    if _INVISIBLE_RE.search(text):
+        return False
+    clean, obf = normalize_text(text)
+    clean = clean.strip()
+    if len(clean) >= 220 or obf:
         return False
     if _ROUTING_RE.search(clean) or _EMOJI_ROUTING_RE.search(clean):
+        return False
+    own = {u.lower() for u in OWN_USERNAMES}
+    if any(h.lower() not in own for h in _HANDLE_RE.findall(text)):
         return False
     if _LINK_RE.search(clean) or re.search(r"[1-9]️⃣|[①-⑩]", clean):
         return False
@@ -1689,44 +2049,75 @@ def is_genuine_buyer_question(text: str) -> bool:
         return False
     if _SELLER_ASK_RE.search(clean):
         return False
-    if re.search(r"\b(?:продам|продаю|скупаю|скупка|продажа|куплю\s+(?:зв|акк|тон|нфт|голд))", clean):
+    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(clean))
+    if _SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", clean)):
         return False
-    if sum(1 for pat, _p, _l in _SPAM_LEXICON if pat.search(clean)) >= 2:
+    hit_topics = {label for pat, _p, label in _SPAM_LEXICON if pat.search(clean)}
+    if len(hit_topics) >= 2:
         return False
+    if hit_topics & _BUYER_BLOCKING_TOPICS and not buyer_purchase:
+        # "сколько звезд за пост?" is a buyer; "сколько звезд хочешь бесплатно?" is not.
+        if hit_topics - {"stars", "crypto", "tg_goods", "nft_gifts"}:
+            return False
     has_q = "?" in clean
-    has_trigger = any(p.search(clean) for p in BUYER_PATTERNS)
+    has_trigger = buyer_purchase or any(p.search(clean) for p in BUYER_PATTERNS)
     if has_trigger and (has_q or len(clean) < 120):
         return True
     # A bare short question about ads/our channel ("а сколько?", "есть место?")
-    if has_q and len(clean) < 120 and not any(pat.search(clean) for pat, _p, _l in _SPAM_LEXICON):
+    if has_q and len(clean) < 120 and not hit_topics:
         return bool(re.search(r"\b(?:реклам\w*|пост\w*|канал\w*|чат\w*|размещ\w*|закреп\w*|стоит|цен\w*)\b", clean))
     return False
 
 
-def is_hard_spam(text: str, message: Any = None) -> Tuple[bool, str]:
+def is_hard_spam(text: str, message: Any = None, ping_kind: Optional[str] = None) -> Tuple[bool, str]:
     """Structural evidence a human never produces by accident."""
+    if ping_kind == "stealth":
+        return True, "stealth_ping"
     if not text and not (message is not None and getattr(message, "via_bot_id", None)):
         return False, ""
     hard = _hard_evidence(text or "", message)
     return (True, hard[0]) if hard else (False, "")
 
 
-def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = None) -> bool:
+def _is_visual_media(message: Any) -> bool:
+    media = getattr(message, "media", None) if message is not None else None
+    if media is None:
+        return False
+    name = type(media).__name__
+    return name in ("MessageMediaPhoto", "MessageMediaDocument")
+
+
+def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = None, ping_kind: Optional[str] = None) -> bool:
     """
     Auto-clear gate.
 
-    Hard structural spam is always cleared. Heuristic advertising is cleared
-    only when it pinged us (is_ping=True) or no ping context was given. A real
-    buyer question is never cleared.
+    Hard structural spam (hidden tags, inline bots, autoposter watermarks,
+    stealth pings) is always cleared. Heuristic advertising is cleared only
+    when it pinged us (is_ping=True) or no ping context was given. A real buyer
+    question is never cleared.
     """
-    hard, _ = is_hard_spam(text, message)
+    hard, _ = is_hard_spam(text, message, ping_kind=ping_kind)
     if hard:
         return True
     if is_genuine_buyer_question(text):
         return False
     if is_ping is False:
         return False
-    return is_spam_message(text, message)[0]
+    # A stranger tagging us on a picture/video with (almost) no text and not as
+    # a reply to our post: the ad is in the image. Real buyers ask in words.
+    if ping_kind == "name":
+        # Strangers addressing us by name ("Имя, привет! ...") with any
+        # commercial content: bots do this, buyers write "@user почем?".
+        score, _t, _f = calculate_spam_score(text, message, ping_kind=ping_kind)
+        if score >= SPAM_THRESHOLD - 15:
+            return True
+    if ping_kind in ("username", "name") and _is_visual_media(message):
+        rest = re.sub(r"[\W_]+", "", _strip_mentions(text or ""))
+        if len(rest) < 12:
+            return True
+        score, _t, _f = calculate_spam_score(text, message, ping_kind=ping_kind)
+        return score >= SPAM_THRESHOLD - 15
+    return is_spam_message(text, message, ping_kind=ping_kind)[0]
 
 def is_gatekeeper_text(text: str) -> bool:
     if not text:
@@ -1852,6 +2243,17 @@ async def fetch_album(client: TelegramClient, message: Any) -> List[Any]:
     return [album[k] for k in sorted(album)][:10]
 
 
+def _is_downloadable_media(message: Any) -> bool:
+    """
+    Real attachments only. A link preview (MessageMediaWebPage) is NOT one:
+    Telethon happily downloads the preview picture, so a text post with a link
+    used to be re-sent as a photo + caption (or as a separate picture).
+    """
+    from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+    media = getattr(message, "media", None)
+    return isinstance(media, (MessageMediaPhoto, MessageMediaDocument))
+
+
 async def save_media_from_message(
     client: TelegramClient,
     message: Any,
@@ -1869,16 +2271,42 @@ async def save_media_from_message(
     if getattr(message, "grouped_id", None):
         album_messages = await fetch_album(client, message)
         for idx, m in enumerate(album_messages):
-            if m.media:
+            if _is_downloadable_media(m):
                 file_path = await client.download_media(m, file=str(target_dir / f"item_{item_index}_{idx}"))
                 if file_path:
                     saved_paths.append(str(file_path))
-    elif getattr(message, "media", None):
+    elif _is_downloadable_media(message):
         file_path = await client.download_media(message, file=str(target_dir / f"item_{item_index}_0"))
         if file_path:
             saved_paths.append(str(file_path))
 
     return saved_paths
+
+def _resolve_media_path(path: str) -> Optional[str]:
+    """Saved absolute path, or the same file under the current MEDIA_DIR
+    (the bot folder was moved / renamed since the post was saved)."""
+    if os.path.exists(path):
+        return path
+    try:
+        p = Path(path)
+        alt = MEDIA_DIR / p.parent.name / p.name
+        if alt.exists():
+            return str(alt)
+    except Exception:
+        pass
+    return None
+
+
+# "This chat does not allow <media type>" errors. The post is then sent as
+# text only instead of failing (and being retried) forever.
+_MEDIA_FORBIDDEN_ERRORS = tuple(
+    getattr(errors, _n) for _n in (
+        "ChatSendMediaForbiddenError", "ChatSendPhotosForbiddenError", "ChatSendVideosForbiddenError",
+        "ChatSendGifsForbiddenError", "ChatSendDocsForbiddenError", "ChatSendAudiosForbiddenError",
+        "ChatSendVoicesForbiddenError", "ChatSendStickersForbiddenError",
+    ) if hasattr(errors, _n)
+)
+
 
 async def send_single_item(
     client: TelegramClient,
@@ -1887,8 +2315,17 @@ async def send_single_item(
     entities_hex: List[str],
     media_files: List[str]
 ):
+    """
+    Send one post (text, one media or one album) exactly as saved.
+
+    parse_mode=None everywhere: without it Telethon re-parsed every post as
+    Markdown, so "__", "**" or "[x](y)" in an ad were silently mangled and
+    album captions lost their formatting.
+    """
     entities = deserialize_entities(entities_hex)
-    existing_media = [f for f in media_files if os.path.exists(f)]
+    existing_media = [p for p in (_resolve_media_path(f) for f in (media_files or []) if f) if p]
+    if media_files and len(existing_media) != len(media_files):
+        log_error(f"[WARN] Не найдено {len(media_files) - len(existing_media)} медиа-файл(ов) поста — отправляю что есть.")
     fmt_entities = entities if entities else None
 
     if not text and not existing_media:
@@ -1896,26 +2333,34 @@ async def send_single_item(
         return
 
     if existing_media:
-        if len(existing_media) == 1:
+        files: Any = existing_media[0] if len(existing_media) == 1 else existing_media
+        try:
             await client.send_file(
                 chat_peer,
-                file=existing_media[0],
+                file=files,
                 caption=text or None,
-                formatting_entities=fmt_entities
+                formatting_entities=fmt_entities,
+                parse_mode=None,
             )
-        else:
-            await client.send_file(
-                chat_peer,
-                file=existing_media,
-                caption=text or None,
-                formatting_entities=fmt_entities
-            )
-    else:
-        await client.send_message(
-            chat_peer,
-            message=text,
-            formatting_entities=fmt_entities
-        )
+            return
+        except errors.MediaCaptionTooLongError:
+            # Caption above the account's limit: media first, the text right
+            # after it (the only way Telegram accepts it).
+            await client.send_file(chat_peer, file=files, parse_mode=None)
+            if text:
+                await client.send_message(chat_peer, message=text, formatting_entities=fmt_entities, parse_mode=None)
+            return
+        except _MEDIA_FORBIDDEN_ERRORS:
+            if not text:
+                raise
+            log_error("[MEDIA] В этом чате запрещены медиа — отправляю текст поста без вложений.")
+
+    await client.send_message(
+        chat_peer,
+        message=text,
+        formatting_entities=fmt_entities,
+        parse_mode=None,
+    )
 
 async def send_broadcast_post(
     client: TelegramClient,
@@ -1986,6 +2431,11 @@ def _extract_folder_title(dialog_filter: Any) -> str:
     return ""
 
 async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[int]:
+    return (await get_folder_chats(client, folder_name)) or []
+
+
+async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional[List[int]]:
+    """Chat ids of a Telegram folder, or None when no folder has that title."""
     result = await client(GetDialogFiltersRequest())
     target_clean = folder_name.lower().strip()
     target_filter = None
@@ -2003,7 +2453,7 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
                 break
 
     if not target_filter:
-        return []
+        return None
 
     chat_ids = set()
     for peer in list(getattr(target_filter, "include_peers", []) or []) + list(getattr(target_filter, "pinned_peers", []) or []):
@@ -2031,7 +2481,7 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
 
     if has_flags:
         try:
-            async for dialog in client.iter_dialogs(limit=300):
+            async for dialog in client.iter_dialogs(limit=1000):
                 cid = dialog.id
                 if cid in exclude_ids:
                     continue
@@ -2287,6 +2737,8 @@ class BroadcasterService:
         self._folder_cache: Dict[Tuple[str, str], Tuple[float, List[int]]] = {}
         self._last_folder_log: Dict[Tuple[str, str], float] = {}
         self._bg_tasks: Set[asyncio.Task] = set()
+        self._folder_missing: Dict[Tuple[str, str], int] = {}
+        self._force_folder_sync = False
 
     # ------------------------------------------------------------------ life
     def start(self):
@@ -2324,6 +2776,10 @@ class BroadcasterService:
         if BroadcasterService._ACTIVE_INSTANCES.get(self.account_id) is self:
             BroadcasterService._ACTIVE_INSTANCES.pop(self.account_id, None)
 
+    def request_folder_sync(self):
+        """Run the folder sync on the next scheduler tick (after .продолжить)."""
+        self._force_folder_sync = True
+
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
         lock = self._chat_locks.get(chat_id)
         if lock is None:
@@ -2339,6 +2795,7 @@ class BroadcasterService:
             return 0
 
         enrolled_total = 0
+        folder_cache: Dict[str, Optional[List[int]]] = {}
         for fb in folder_broadcasts:
             folder_name = (fb.get("folder_name") or "").strip()
             template_name = fb.get("template_name") or ""
@@ -2347,12 +2804,23 @@ class BroadcasterService:
 
             cache_key = (folder_name, template_name)
             try:
-                live_chats = await get_chats_in_folder(self.client, folder_name)
+                if folder_name not in folder_cache:
+                    folder_cache[folder_name] = await get_folder_chats(self.client, folder_name)
+                live_chats = folder_cache[folder_name]
             except Exception as e:
                 log_error(f"[FOLDER] Не удалось прочитать папку \"{folder_name}\": {e}")
                 continue
-            if not live_chats:
-                continue
+
+            if live_chats is None:
+                # Folder renamed or deleted. Park its chats after a few misses
+                # instead of broadcasting into them forever.
+                misses = self._folder_missing.get(cache_key, 0) + 1
+                self._folder_missing[cache_key] = misses
+                if misses < 3:
+                    continue
+                live_chats = []
+            else:
+                self._folder_missing.pop(cache_key, None)
 
             live_set = set(live_chats)
             enrolled_set = db.get_enrolled_chat_ids(template_name, folder_name, account_id=self.account_id)
@@ -2407,7 +2875,8 @@ class BroadcasterService:
                 if now - last_gc > 600:
                     gc.collect()
                     last_gc = now
-                if now - last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
+                if self._force_folder_sync or now - last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
+                    self._force_folder_sync = False
                     last_folder_sync = now
                     try:
                         await self.sync_folder_broadcasts()
@@ -2427,6 +2896,14 @@ class BroadcasterService:
                     if sent:
                         await asyncio.sleep(self.PAUSE_BETWEEN_CHATS)
 
+                for task in db.get_due_retries(account_id=self.account_id):
+                    if not self.is_running or time.time() < self._flood_until:
+                        break
+                    if not db.claim_retry(task["id"], time.time()):
+                        continue
+                    if await self._deliver(task):
+                        await asyncio.sleep(self.PAUSE_BETWEEN_CHATS)
+
                 await asyncio.sleep(self._next_wake())
             except asyncio.CancelledError:
                 break
@@ -2437,6 +2914,7 @@ class BroadcasterService:
     def _next_wake(self) -> float:
         try:
             tasks = db.get_active_interval_tasks(account_id=self.account_id)
+            retry_at = db.next_retry_at(account_id=self.account_id)
         except Exception:
             return 5.0
         wait = 5.0
@@ -2444,6 +2922,8 @@ class BroadcasterService:
         for t in tasks:
             left = (t.get("interval_seconds") or 0) - (now - (t.get("last_sent_at") or 0))
             wait = min(wait, max(left, 0.0))
+        if retry_at:
+            wait = min(wait, max(retry_at - now, 0.0))
         return max(1.0, wait)
 
     async def _run_scheduled(self, task: Dict[str, Any]) -> bool:
@@ -2460,6 +2940,8 @@ class BroadcasterService:
     # -------------------------------------------------------------- counter
     def on_incoming_message(self, chat_id: int):
         """Called from the event handler. Never blocks update processing."""
+        if not self.is_running:
+            return
         t = asyncio.ensure_future(self.handle_counter_event(chat_id))
         self._bg_tasks.add(t)
         t.add_done_callback(self._bg_tasks.discard)
@@ -2467,24 +2949,52 @@ class BroadcasterService:
     async def handle_counter_event(self, chat_id: int):
         # increment_and_check_counter() resets the counter in the same
         # statement that reports it ready, so a task can only be claimed once.
-        for task in db.increment_and_check_counter(chat_id, account_id=self.account_id):
+        try:
+            ready = db.increment_and_check_counter(chat_id, account_id=self.account_id)
+        except Exception as e:
+            log_error(f"[COUNT] Ошибка счётчика чата {chat_id}: {e}")
+            return
+        for task in ready:
+            if time.time() < self._flood_until:
+                db.schedule_retry(task, delay=self._flood_until - time.time() + 2, failed=False)
+                continue
             await self._deliver(task)
 
     # ---------------------------------------------------------------- send
+    def _backoff(self, task: Dict[str, Any], base: float, cap: float = 6 * 3600) -> float:
+        try:
+            fails = db.get_fail_count(task["id"])
+        except Exception:
+            fails = 0
+        return min(cap, base * (2 ** min(fails, 10)))
+
     async def _deliver(self, task: Dict[str, Any]) -> bool:
         chat_id = task["chat_id"]
         template_name = task["template_name"]
-        rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
+        rotation_tpl = db.get_next_rotation_template(
+            chat_id,
+            account_id=self.account_id,
+            rotation_name=template_name,
+            member_of_chat_rotation=template_name,
+        )
         effective_name = rotation_tpl or template_name
 
         outcome = await self._send_task(task["id"], chat_id, effective_name, task=task)
-        if outcome == "retry":
-            db.schedule_retry(task, delay=self.RETRY_DELAY)
+        if outcome == "sent":
+            try:
+                db.mark_task_sent(task["id"])
+            except Exception:
+                pass
+        elif outcome == "retry":
+            db.schedule_retry(task, delay=self._backoff(task, self.RETRY_DELAY, cap=3600))
+        elif outcome == "busy":
+            db.schedule_retry(task, delay=5.0, failed=False)
         return outcome == "sent"
 
     async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> str:
         """
-        Returns "sent", "retry" (server rejected it, try again later) or "skip".
+        Returns "sent", "retry" (server rejected it, try again later), "busy"
+        (another send to this chat is running) or "skip".
 
         A network error in the middle of a send is ambiguous: Telegram may well
         have published the message already. Those are treated as sent, because
@@ -2492,13 +3002,17 @@ class BroadcasterService:
         """
         template = db.get_template(template_name)
         if not template:
-            log_error(f"[ERROR] Шаблон '{template_name}' не найден")
+            log_error(f"[ERROR] Шаблон '{template_name}' не найден — задача рассылки отключена")
+            try:
+                db.deactivate_task(task_id)
+            except Exception:
+                pass
             return "skip"
 
         lock = self._chat_lock(chat_id)
         if lock.locked():
             log_info(f"[DEDUP] Чат {chat_id}: отправка уже идёт, дубликат пропущен.")
-            return "skip"
+            return "busy"
 
         async with lock:
             self._sending_chats.add(chat_id)
@@ -2524,22 +3038,22 @@ class BroadcasterService:
             except errors.SlowModeWaitError as e:
                 log_error(f"[SLOWMODE] Чат {chat_id}: медленный режим, ждать {e.seconds}с")
                 if task is not None:
-                    db.schedule_retry(task, delay=e.seconds + 2)
+                    db.schedule_retry(task, delay=e.seconds + 2, failed=False)
                 return "skip"
             except errors.FloodWaitError as e:
                 log_error(f"[FLOOD] FloodWait {e.seconds}с (чат {chat_id}) — пауза всех отправок аккаунта")
                 self._flood_until = time.time() + e.seconds + 1
                 if task is not None:
-                    db.schedule_retry(task, delay=e.seconds + 2)
+                    db.schedule_retry(task, delay=e.seconds + 2, failed=False)
                 return "skip"
-            except (errors.UserBannedInChannelError, errors.ChannelPrivateError) as e:
-                log_error(f"[PERM] Нет доступа к чату {chat_id} ({type(e).__name__}). Рассылка в нём отключена.")
-                db.deactivate_task(task_id)
-                return "skip"
-            except errors.ChatWriteForbiddenError:
-                log_error(f"[RESTRICT] Чат {chat_id}: писать запрещено, повтор позже.")
+            except (errors.UserBannedInChannelError, errors.ChannelPrivateError, errors.ChatWriteForbiddenError,
+                    errors.ChatAdminRequiredError, errors.ChatRestrictedError) as e:
+                # Not deactivated: a folder sync would re-enable it a minute
+                # later and the cycle would repeat forever. Back off instead.
+                delay = self._backoff(task or {"id": task_id}, 600) if task is not None else 600
+                log_error(f"[PERM] Чат {chat_id}: писать нельзя ({type(e).__name__}). Повтор через {_format_seconds(int(delay))}.")
                 if task is not None:
-                    db.schedule_retry(task, delay=600)
+                    db.schedule_retry(task, delay=delay)
                 return "skip"
             except errors.RPCError as e:
                 log_error(f"[ERROR] Telegram отклонил отправку в чат {chat_id}: {e}")
@@ -2595,22 +3109,26 @@ HELP_TEXT = """
 *(Имя чередования можно сразу передавать в `.рассыл`, например: `.рассыл через 10 соо минимум 10 минут связка1 "папка"`)*
 
 **6. Управление статусом:**
-• `.стоп <название>` / `.stop <name>`
-• `.стоп <название> "папка"`
-• `.стоп все` / `.stop all`
-• `.продолжить <название>` / `.resume <name>`
-• `.продолжить все` / `.resume all`
-• `.удалить <название>` / `.delete <name>`
-• `.удалить все` / `.delete all`
+• `.стоп <название>` / `.stop <name>` — остановить пост **во всех чатах**
+• `.стоп <название> тут` — только в этом чате
+• `.стоп <название> "папка"` — только в чатах папки
+• `.стоп` (без аргументов) — всё в этом чате; `.стоп все` / `.stop all` — всё на аккаунте
+• `.продолжить <название>` / `.resume <name>` — те же варианты (`тут`, `"папка"`, `все`)
+• `.удалить <название>` / `.delete <name>` — удалить пост и его рассылки везде
+• `.удалить <название> тут` / `.удалить все`
+*(Остановленные вручную рассылки не оживают сами после перезапуска или синхронизации папки)*
 
 **7. Просмотр и статистика:**
+• `.рассылки` / `.broadcasts` / `.list` — **все активные и остановленные рассылки по всем чатам** (удобно найти «забытые»)
 • `.просмотр <название>` / `.view <name>` — тестовая отправка поста со всеми медиа (или проверка чередования)
 • `.просмотр все` / `.view all` — список всех рассылок и чередований в этом чате
 
 **8. Антиспам и авто-подписка:**
-• Гасит только те спам-сообщения, которые **пинганули тебя** (упоминание, ответ на твой пост, скрытый тег). Обычная реклама в чате не трогается.
-• Снимается только пинг этого спам-сообщения. Если в чате есть непрочитанный ответ от живого человека, он остаётся непрочитанным.
-• Ловит скупку/продажу звёзд, TON, NFT-подарков, аккаунтов, «заработок», казино, накрутку, скрытые теги и вотермарки автопостеров.
+• Гасит только те спам-сообщения, которые **пинганули тебя**: упоминание `@юзернейма`, ответ на твой пост, упоминание по имени, а также **скрытый пинг** (тег без юзернейма и без ответа — всегда считается спамом).
+• Медиа (фото/видео) с пингом и рекламной подписью или почти без текста — спам.
+• Понимает обфускацию: латиница вместо кириллицы (`3вёзды`, `zвезды`), буквы через точки/пробелы, «красивые» шрифты, транслит.
+• Ловит скупку/продажу звёзд, TON, NFT-подарков, Premium/бустов, юзов, аккаунтов, «заработок», казино, накрутку, 18+, мошенничество, рекламу каналов и вотермарки автопостеров.
+• Живые вопросы («где купить рекламу?», «сколько стоит?») не трогаются. Если в чате есть непрочитанный ответ от живого человека, он остаётся непрочитанным.
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
 
 **9. Заглушение конкретных людей:**
@@ -2813,6 +3331,8 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
 
     return mode, interval_sec, threshold_count, template_name, folder_name, ""
 
+_BG_NOTIFY_TASKS: Set["asyncio.Future"] = set()
+
 async def _notify(event: Any, text: str, auto_delete: int = 5, force_respond: bool = False):
     msg = None
     try:
@@ -2841,7 +3361,9 @@ async def _notify(event: Any, text: str, auto_delete: int = 5, force_respond: bo
                 await target_msg.delete()
             except Exception:
                 pass
-        asyncio.create_task(_delayed_delete(msg, auto_delete))
+        t = asyncio.ensure_future(_delayed_delete(msg, auto_delete))
+        _BG_NOTIFY_TASKS.add(t)
+        t.add_done_callback(_BG_NOTIFY_TASKS.discard)
 
 class MessageDedupRing:
     """O(1) ring buffer for message deduplication across reconnects and burst updates."""
@@ -2864,6 +3386,91 @@ class MessageDedupRing:
 
 _GLOBAL_DEDUP_RING = MessageDedupRing(2000)
 
+def _letters(s: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]", "", unicodedata.normalize("NFKC", s or "").lower())
+
+
+def _mention_entity_kind(text: str, message: Any, my_id: int, names: List[str], usernames: List[str]) -> Optional[str]:
+    """
+    Look at entities that point at OUR account. "name" when the visible label
+    looks like our name / username (a normal mention), "hidden" when it is an
+    emoji, a space or unrelated words (a stealth tag), None when absent.
+    """
+    entities = getattr(message, "entities", None) if message is not None else None
+    if not entities or not my_id:
+        return None
+    from telethon.tl.types import MessageEntityMentionName, InputMessageEntityMentionName, MessageEntityTextUrl
+    own_labels = [_letters(n) for n in list(names) + list(usernames) if _letters(n)]
+    kind: Optional[str] = None
+    for ent in entities:
+        target = None
+        if isinstance(ent, MessageEntityMentionName):
+            target = getattr(ent, "user_id", None)
+        elif isinstance(ent, InputMessageEntityMentionName):
+            target = getattr(getattr(ent, "user_id", None), "user_id", None)
+        elif isinstance(ent, MessageEntityTextUrl):
+            url = (ent.url or "").lower()
+            m = re.search(r"tg://user\?id=(\d+)", url)
+            if m:
+                target = int(m.group(1))
+            else:
+                m = re.search(r"t\.me/([a-z0-9_]{4,32})/?$", url)
+                if m and m.group(1) in [u.lower() for u in usernames]:
+                    target = my_id
+        if target is None or int(target) != int(my_id):
+            continue
+        label = _letters(_utf16_slice(text or "", ent.offset, ent.length))
+        looks_like_us = bool(label) and any(
+            lbl in label or (len(label) >= 3 and (label in lbl or label[:4] == lbl[:4]))
+            for lbl in own_labels
+        )
+        if not looks_like_us:
+            return "hidden"
+        kind = "name"
+    return kind
+
+
+async def classify_ping(event: Any, message: Any, text: str, my_id: int,
+                        usernames: List[str], names: List[str]) -> Optional[str]:
+    """
+    How a message reached us: "reply", "username", "name", "stealth" or None.
+
+    "stealth" = Telegram flagged it as mentioning us but it is neither a reply
+    to our message nor a visible @username / name mention. That is exactly the
+    hidden-tag trick spammers use, and it is always cleared.
+    """
+    mentioned = bool(getattr(message, "mentioned", False))
+    typed_username = bool(text) and any(
+        re.search(rf"(?<![\w@])@{re.escape(u)}(?!\w)", text, re.IGNORECASE) for u in usernames if u
+    )
+    ent_kind = _mention_entity_kind(text, message, my_id, names, usernames)
+    if not mentioned and not typed_username and ent_kind is None:
+        return None
+
+    reply_unknown = False
+    if getattr(event, "is_reply", False):
+        try:
+            reply_msg = await event.get_reply_message()
+        except Exception:
+            reply_msg = None
+        if reply_msg is None:
+            reply_unknown = True
+        elif getattr(reply_msg, "sender_id", None) == my_id or getattr(reply_msg, "out", False):
+            return "reply"
+
+    if ent_kind == "hidden":
+        return "stealth"
+    if typed_username:
+        return "username"
+    if ent_kind == "name":
+        return "name"
+    if mentioned:
+        # A reply whose original we could not load (other chat / deleted)
+        # is given the benefit of the doubt.
+        return "unknown" if reply_unknown else "stealth"
+    return None
+
+
 def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_id: int, acc_cfg: Optional[Dict[str, Any]] = None):
     # Always keep client's broadcaster reference current
     client._spambuster_broadcaster = broadcaster
@@ -2881,7 +3488,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     auto_read_spam = acc_cfg.get("auto_read_spam_pings", True)
     auto_sub = acc_cfg.get("auto_sub_enabled", True)
     auto_folder = acc_cfg.get("auto_sub_folder", "автосабнутое")
-    my_username = getattr(getattr(client, "_self_user", None), "username", None) or acc_cfg.get("username") or ""
+    me_obj = getattr(client, "_self_user", None)
+    my_username = getattr(me_obj, "username", None) or acc_cfg.get("username") or ""
+    my_usernames: List[str] = [u for u in {my_username.lower()} if u]
+    for un in (getattr(me_obj, "usernames", None) or []):
+        u = (getattr(un, "username", "") or "").lower()
+        if u and getattr(un, "active", True) and u not in my_usernames:
+            my_usernames.append(u)
+    my_names: List[str] = [n for n in (getattr(me_obj, "first_name", None), getattr(me_obj, "last_name", None)) if n]
+    OWN_USERNAMES.update(my_usernames)
 
     # Warm the mute index so the very first incoming message is filtered too.
     mute_cache_rebuild(my_id)
@@ -2915,24 +3530,20 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         text = event.raw_text or ""
         message = event.message
 
-        # Did this message actually reach us? (mention / reply to our post /
-        # our @handle typed in the text)
-        is_ping = bool(getattr(message, "mentioned", False))
-        reply_to_me = False
-        if not is_ping and event.is_reply:
-            try:
-                reply_msg = await event.get_reply_message()
-                reply_to_me = bool(reply_msg and reply_msg.sender_id == my_id)
-            except Exception:
-                reply_to_me = False
-            is_ping = reply_to_me
-        if not is_ping and my_username and text:
-            if re.search(rf"(?<![\w@])@{re.escape(my_username)}(?!\w)", text, re.IGNORECASE):
-                is_ping = True
+        # Did this message actually reach us, and how? reply to our post /
+        # our @handle typed / a mention of our name / a hidden ("stealth") tag.
+        # Only mentions trigger a reply lookup: fetching the replied message
+        # for every reply in every chat flooded the account with requests.
+        try:
+            ping_kind = await classify_ping(event, message, text, my_id, my_usernames, my_names)
+        except Exception as e:
+            log_error(f"[PING] Не удалось разобрать упоминание: {e}")
+            ping_kind = "unknown" if getattr(message, "mentioned", False) else None
+        is_ping = ping_kind is not None
 
         if auto_read_spam and is_ping:
             target_peer = getattr(event, "input_chat", None) or chat_id
-            if should_auto_read(text, message, is_ping=True):
+            if should_auto_read(text, message, is_ping=True, ping_kind=ping_kind if ping_kind != "unknown" else None):
                 await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id)
             else:
                 note_genuine_ping(my_id, chat_id, msg_id or 0)
@@ -3020,7 +3631,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     ".закончить", ".завершить", ".готово",
                     ".мутить", ".мут", ".mute", ".ignore",
                     ".размутить", ".размут", ".unmute", ".unignore",
-                    ".заглушенные", ".мутлист", ".mutelist"
+                    ".заглушенные", ".мутлист", ".mutelist", ".рассылки", ".broadcasts"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -3094,6 +3705,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             await handle_view(event, parts)
             return
 
+        if cmd in (".рассылки", ".все-рассылки", ".broadcasts", ".list"):
+            await handle_list_all(event)
+            return
+
     async def handle_collector_start(event: Any, raw: str, session_type: str):
         mode, interval_sec, threshold_count, template_name, folder_name, err = parse_broadcast_params(raw.splitlines()[0])
         if err:
@@ -3121,16 +3736,24 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                         item_index=0,
                         clear_existing=False
                     )
-                text = reply_msg.raw_text or ""
-                entities_hex = serialize_entities(reply_msg.entities)
+                caption_msg = reply_msg
+                msg_ids = [reply_msg.id]
+                if grouped_id:
+                    # The whole album, not just the photo the command replied
+                    # to (forwarding one id sent a single picture of the album).
+                    album = await fetch_album(client, reply_msg)
+                    msg_ids = [m.id for m in album]
+                    caption_msg = next((m for m in album if m.raw_text or m.entities), reply_msg)
+                text = caption_msg.raw_text or ""
+                entities_hex = serialize_entities(caption_msg.entities)
                 is_fwd = bool(getattr(reply_msg, "fwd_from", None))
                 items.append({
                     "text": text,
                     "entities_hex": entities_hex,
                     "media_files": saved_media,
-                    "is_forward": is_fwd or (session_type == "forwarded"),
+                    "is_forward": is_fwd,
                     "forward_chat_id": reply_msg.chat_id,
-                    "forward_msg_ids": [reply_msg.id],
+                    "forward_msg_ids": msg_ids,
                     "grouped_id": grouped_id
                 })
 
@@ -3199,7 +3822,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 "text": text,
                 "entities_hex": serialize_entities(msg.entities),
                 "media_files": [],
-                "is_forward": bool(getattr(msg, "fwd_from", None)) or (session["session_type"] == "forwarded"),
+                "is_forward": bool(getattr(msg, "fwd_from", None)),
                 "forward_chat_id": event.chat_id,
                 "forward_msg_ids": [msg.id],
                 "grouped_id": grouped_id,
@@ -3243,7 +3866,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             "text": text,
             "entities_hex": entities_hex,
             "media_files": saved_media,
-            "is_forward": is_fwd or (session["session_type"] == "forwarded"),
+            "is_forward": is_fwd,
             "forward_chat_id": event.chat_id,
             "forward_msg_ids": [msg.id],
             "grouped_id": grouped_id
@@ -3399,7 +4022,14 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 await _notify(event, "⚠️ Нет текста или медиа. Ответьте командой на сообщение с рекламой или укажите текст со следующей строки.")
                 return
 
-        if text or media_files:
+        content_is_new = bool(text or media_files) and not (
+            existing and text == existing["text"] and media_files == existing["media_files"]
+            and entities_hex == existing["entities_hex"]
+        )
+        if content_is_new:
+            # Only when new content was given: re-saving the old text used to
+            # wipe the saved multi-message bundle, so a pack of posts turned
+            # into its first message only.
             db.save_template(template_name, text, entities_hex, media_files)
 
         target_chats = []
@@ -3712,114 +4342,181 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         await _notify(event, "\n".join(lines), auto_delete=20)
 
-    async def handle_stop(event: Any, parts: List[str], raw: str):
-        folder_name, remaining = _extract_quoted_folder(raw)
-        tokens = remaining.split()
-        target_name = tokens[1].strip("<>").strip() if len(tokens) > 1 else "все"
+    _HERE_WORDS = ("тут", "здесь", "here")
 
-        target_chats = await get_chats_in_folder(client, folder_name) if folder_name else []
-        count = db.set_broadcast_status(
+    def _parse_scope(raw: str) -> Tuple[str, str, bool, bool]:
+        """
+        (target_name, folder_name, here, explicit_name) for .стоп/.продолжить/.удалить.
+
+        .стоп X            -> X everywhere (every chat and folder)
+        .стоп X "папка"    -> X only in that folder
+        .стоп X тут        -> X only in this chat
+        .стоп все          -> everything of this account
+        .стоп              -> everything in this chat
+        """
+        folder_name, remaining = _extract_quoted_folder(raw.splitlines()[0] if raw else "")
+        tokens = remaining.split()[1:]
+        here = any(t.lower() in _HERE_WORDS for t in tokens)
+        tokens = [t for t in tokens if t.lower() not in _HERE_WORDS]
+        if tokens:
+            return tokens[0].strip("<>").strip(), folder_name, here, True
+        # No name: the current chat (or the folder, if one was given).
+        return "все", folder_name, not folder_name, False
+
+    def _scope_label(target_name: str, folder_name: str, here: bool) -> str:
+        what = "все рассылки" if target_name.lower() in ("все", "all") else f"**{target_name}**"
+        if folder_name:
+            return f"{what} в папке \"{folder_name}\""
+        if here:
+            return f"{what} в этом чате"
+        return f"{what} во всех чатах и папках"
+
+    async def handle_stop(event: Any, parts: List[str], raw: str):
+        target_name, folder_name, here, _ = _parse_scope(raw)
+        is_all = target_name.lower() in ("все", "all")
+        target_chats = (await get_chats_in_folder(client, folder_name)) if folder_name else []
+        chat_scope = [event.chat_id] if here else (target_chats or None)
+
+        count = db.stop_tasks(
             account_id=my_id,
             name=target_name,
-            chat_id=None if folder_name else event.chat_id,
-            chat_ids=target_chats if folder_name else None,
-            folder_name=folder_name,
-            is_active=0
+            chat_ids=chat_scope,
+            folder_name=folder_name or None,
+            manual=here,
         )
-        if target_name.lower() in ("все", "all"):
+        if not here:
+            db.set_folder_broadcast_status(folder_name=folder_name or None, name=target_name, is_active=0, account_id=my_id)
+        if is_all:
             db.set_rotation_status(
                 account_id=my_id,
-                chat_id=None if folder_name else event.chat_id,
+                chat_id=event.chat_id if here else None,
                 chat_ids=target_chats if folder_name else None,
-                is_active=0
+                is_active=0,
             )
-        else:
-            named_rot = db.get_named_rotation(target_name, account_id=my_id)
-            if named_rot:
-                with db._conn() as conn:
-                    conn.execute("UPDATE chat_rotations SET is_active = 0 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
-
-        db.set_folder_broadcast_status(
-            folder_name=folder_name or None,
-            name=target_name,
-            is_active=0,
-            account_id=my_id
-        )
-        folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
-        await _notify(event, f"⏹ Остановлено рассылок: {count}{folder_str}")
+        elif not here and not folder_name and db.get_named_rotation(target_name, account_id=my_id):
+            with db._conn() as conn:
+                conn.execute(
+                    "UPDATE chat_rotations SET is_active = 0 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)",
+                    (target_name, f"<{target_name}>", my_id),
+                )
+        await _notify(event, f"⏹ Остановлено: {_scope_label(target_name, folder_name, here)} (задач: {count})")
 
     async def handle_resume(event: Any, parts: List[str], raw: str):
-        folder_name, remaining = _extract_quoted_folder(raw)
-        tokens = remaining.split()
-        target_name = tokens[1].strip("<>").strip() if len(tokens) > 1 else "все"
+        target_name, folder_name, here, _ = _parse_scope(raw)
+        is_all = target_name.lower() in ("все", "all")
+        target_chats = (await get_chats_in_folder(client, folder_name)) if folder_name else []
+        chat_scope = [event.chat_id] if here else (target_chats or None)
 
-        target_chats = await get_chats_in_folder(client, folder_name) if folder_name else []
-        count = db.set_broadcast_status(
+        count = db.resume_tasks(
             account_id=my_id,
             name=target_name,
-            chat_id=None if folder_name else event.chat_id,
-            chat_ids=target_chats if folder_name else None,
-            folder_name=folder_name,
-            is_active=1
+            chat_ids=chat_scope,
+            folder_name=folder_name or None,
         )
-        if target_name.lower() in ("все", "all"):
+        if not here:
+            db.set_folder_broadcast_status(folder_name=folder_name or None, name=target_name, is_active=1, account_id=my_id)
+        if is_all:
             db.set_rotation_status(
                 account_id=my_id,
-                chat_id=None if folder_name else event.chat_id,
+                chat_id=event.chat_id if here else None,
                 chat_ids=target_chats if folder_name else None,
-                is_active=1
+                is_active=1,
             )
-        else:
-            named_rot = db.get_named_rotation(target_name, account_id=my_id)
-            if named_rot:
-                with db._conn() as conn:
-                    conn.execute("UPDATE chat_rotations SET is_active = 1 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
-
-        db.set_folder_broadcast_status(
-            folder_name=folder_name or None,
-            name=target_name,
-            is_active=1,
-            account_id=my_id
-        )
-        folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
-        await _notify(event, f"▶️ Возобновлено рассылок: {count}{folder_str}")
+        elif not here and not folder_name:
+            with db._conn() as conn:
+                conn.execute(
+                    "UPDATE chat_rotations SET is_active = 1 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)",
+                    (target_name, f"<{target_name}>", my_id),
+                )
+        active_b = getattr(client, "_spambuster_broadcaster", broadcaster)
+        try:
+            active_b.request_folder_sync()
+        except Exception:
+            pass
+        await _notify(event, f"▶️ Возобновлено: {_scope_label(target_name, folder_name, here)} (задач: {count})")
 
     async def handle_delete(event: Any, parts: List[str], raw: str):
-        folder_name, remaining = _extract_quoted_folder(raw)
-        tokens = remaining.split()
-        target_name = tokens[1].strip("<>").strip() if len(tokens) > 1 else "все"
+        target_name, folder_name, here, _ = _parse_scope(raw)
+        is_all = target_name.lower() in ("все", "all")
+        target_chats = (await get_chats_in_folder(client, folder_name)) if folder_name else []
+        chat_scope = [event.chat_id] if here else (target_chats or None)
 
-        target_chats = await get_chats_in_folder(client, folder_name) if folder_name else []
-        count = db.delete_broadcasts(
+        count = db.delete_tasks(
             account_id=my_id,
             name=target_name,
-            chat_id=None if folder_name else event.chat_id,
-            chat_ids=target_chats if folder_name else None,
-            folder_name=folder_name
+            chat_ids=chat_scope,
+            folder_name=folder_name or None,
+            keep_folder_tombstones=here,
         )
-        if target_name.lower() in ("все", "all"):
-            if not folder_name:
+
+        if here:
+            if is_all:
+                db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+        else:
+            db.delete_folder_broadcasts(folder_name=folder_name or None, name=target_name, account_id=my_id)
+            if is_all and not folder_name:
                 for tpl in db.list_templates():
                     db.delete_template(tpl["name"])
-                db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+                db.delete_chat_rotation(account_id=my_id)
                 db.delete_all_named_rotations(account_id=my_id)
-            else:
+            elif is_all and folder_name:
                 db.delete_chat_rotation(chat_ids=target_chats, account_id=my_id)
-        else:
-            if not folder_name:
-                remaining_tasks = db.count_tasks_for_template(target_name, account_id=my_id)
-                if remaining_tasks == 0:
-                    db.delete_template(target_name)
-                    db.delete_named_rotation(target_name, account_id=my_id)
+            elif not folder_name:
+                # ".удалить X": X is gone everywhere - template, tasks, rotation.
+                db.delete_template(target_name)
+                db.delete_named_rotation(target_name, account_id=my_id)
 
-        db.delete_folder_broadcasts(
-            folder_name=folder_name or None,
-            name=target_name,
-            account_id=my_id
-        )
+        if not is_all and (here or folder_name) and db.count_live_tasks_for_template(target_name) == 0:
+            # Nothing uses the post any more: drop it so it cannot come back.
+            if not db.get_named_rotation(target_name, account_id=my_id):
+                db.delete_template(target_name)
 
-        folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
-        await _notify(event, f"🗑 Удалено рассылок: {count}{folder_str}")
+        await _notify(event, f"🗑 Удалено: {_scope_label(target_name, folder_name, here)} (задач: {count})")
+
+    async def handle_list_all(event: Any):
+        """Every broadcast of this account in every chat: finds forgotten ones."""
+        tasks = [t for t in db.list_all_tasks(account_id=my_id) if not t.get("manual_stop")]
+        folders = db.list_folder_broadcasts(account_id=my_id)
+        if not tasks and not folders:
+            await _notify(event, "📭 Рассылок нет ни в одном чате.", auto_delete=15)
+            return
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for t in tasks:
+            groups.setdefault(t["template_name"], []).append(t)
+
+        lines = ["📋 **Все рассылки аккаунта (во всех чатах):**\n"]
+        for name in sorted(set(groups) | {f["template_name"] for f in folders}):
+            items = groups.get(name, [])
+            active = [t for t in items if t["is_active"]]
+            sample = (active or items or [{}])[0]
+            mode = sample.get("mode") or next((f["mode"] for f in folders if f["template_name"] == name), "")
+            if mode == "interval":
+                mode_str = f"каждые {_format_seconds(int(sample.get('interval_seconds') or 0))}"
+            elif mode == "hybrid":
+                mode_str = f"через {sample.get('counter_threshold')} соо (кд {_format_seconds(int(sample.get('interval_seconds') or 0))})"
+            elif mode == "counter":
+                mode_str = f"через {sample.get('counter_threshold')} соо"
+            else:
+                mode_str = "—"
+            fnames = sorted({f["folder_name"] for f in folders if f["template_name"] == name and f["is_active"]})
+            folder_str = f" | папки: {', '.join(fnames)}" if fnames else ""
+            status = "🟢" if active else "🔴"
+            lines.append(f"{status} **{name}** — {mode_str} | активных чатов: {len(active)}/{len(items)}{folder_str}")
+            titles = []
+            for t in active[:5]:
+                title = str(t["chat_id"])
+                try:
+                    ent = await client.get_entity(t["chat_id"])
+                    title = getattr(ent, "title", None) or getattr(ent, "first_name", None) or title
+                except Exception:
+                    pass
+                titles.append(title)
+            if titles:
+                more = f" и ещё {len(active) - 5}" if len(active) > 5 else ""
+                lines.append(f"   ↳ {', '.join(titles)}{more}")
+        lines.append("\nУдалить везде: `.удалить <название>` · только тут: `.удалить <название> тут`")
+        await _notify(event, "\n".join(lines), auto_delete=60)
 
     async def handle_view(event: Any, parts: List[str]):
         if len(parts) < 2:
@@ -3916,6 +4613,93 @@ async def authenticate_client(client: TelegramClient, phone_cfg: str, acc_name: 
         password = getpass.getpass(f"[{acc_name}] Введите облачный пароль (2FA): ")
         await client.sign_in(password=password)
 
+# ---------------------------------------------------------------------------
+# Single instance per Telegram account.
+#
+# Two copies of the bot on the same account (autostart + a manual start, an
+# old copy in another folder, Termux + the APK...) each run their own
+# scheduler: every post is sent twice, and the old copy keeps sending
+# broadcasts that were deleted in the new one ("phantom" broadcasts).
+# An OS-level lock keyed by the Telegram user id makes the second copy exit.
+# ---------------------------------------------------------------------------
+_INSTANCE_LOCKS: Dict[str, Any] = {}
+
+
+def _instance_lock_path(key: str) -> Path:
+    import tempfile
+    return Path(tempfile.gettempdir()) / f"spambuster_{re.sub(r'[^A-Za-z0-9_]', '_', key)}.lock"
+
+
+def acquire_instance_lock(key: str) -> bool:
+    """True when this process now owns `key`; False when another copy runs."""
+    if key in _INSTANCE_LOCKS:
+        return False
+    try:
+        fh = open(_instance_lock_path(key), "a+")
+    except Exception:
+        return True  # cannot even create the file: do not block the bot
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    except Exception:
+        pass  # locking not supported on this platform
+    _INSTANCE_LOCKS[key] = fh
+    return True
+
+
+def release_instance_lock(key: str):
+    fh = _INSTANCE_LOCKS.pop(key, None)
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+HEALTH_CHECK_SECONDS = 120
+HEALTH_CHECK_TIMEOUT = 25
+
+
+async def connection_watchdog(client: TelegramClient, label: str = ""):
+    """
+    Telegram silently stops pushing updates to a client that looks idle, and
+    a socket can die without the library noticing (NAT timeout, Wi-Fi <->
+    mobile switch, laptop sleep). Every couple of minutes make a real request;
+    two failures in a row force a reconnect.
+    """
+    from telethon.tl.functions.updates import GetStateRequest
+    failures = 0
+    while True:
+        await asyncio.sleep(HEALTH_CHECK_SECONDS)
+        try:
+            if not client.is_connected():
+                raise ConnectionError("not connected")
+            await asyncio.wait_for(client(GetStateRequest()), timeout=HEALTH_CHECK_TIMEOUT)
+            failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failures += 1
+            if failures >= 2:
+                log_error(f"[WATCHDOG]{label} Соединение не отвечает ({type(e).__name__}). Переподключение...")
+                failures = 0
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+
 async def run_single_account(acc_cfg: Dict[str, Any]):
     acc_name = acc_cfg.get("name", "default")
     api_id = acc_cfg.get("api_id")
@@ -3936,6 +4720,7 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
         retry_delay=2,
         auto_reconnect=True,
         timeout=15,
+        flood_sleep_threshold=60,
     )
 
     while True:
@@ -3949,6 +4734,19 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
     me = await client.get_me()
     username_str = f"@{me.username}" if me.username else me.first_name
 
+    lock_key = f"acct_{me.id}"
+    if not acquire_instance_lock(lock_key):
+        log_error(
+            f"[START][{acc_name}] Бот для аккаунта {username_str} уже запущен в другом окне/процессе. "
+            f"Этот экземпляр закрывается, чтобы не было двойных рассылок. "
+            f"Закрой старый (scripts/stop_*) и запусти заново, если нужно."
+        )
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return
+
     broadcaster = BroadcasterService(client, account_id=me.id)
     broadcaster.start()
 
@@ -3957,12 +4755,14 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
 
     print(f"✅ Аккаунт [{acc_name}] {username_str} (ID: {me.id}) подключен и запущен 24/7!")
 
+    watchdog = asyncio.ensure_future(connection_watchdog(client, f"[{acc_name}]"))
     try:
         while True:
             try:
                 if not client.is_connected():
                     await client.connect()
                 await client.run_until_disconnected()
+                await asyncio.sleep(2)
             except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                 log_error(f"[RECONNECT][{acc_name}] Потеря связи (VPN/сеть): {e}. Автоматический реконнект через 3с...")
                 try:
@@ -3972,8 +4772,21 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
                 break
+            except (errors.AuthKeyUnregisteredError, errors.AuthKeyDuplicatedError, errors.UserDeactivatedError,
+                    errors.UserDeactivatedBanError, errors.SessionRevokedError) as e:
+                log_error(f"[FATAL][{acc_name}] Сессия недействительна ({type(e).__name__}). Удалите файл сессии и войдите заново.")
+                break
+            except Exception as e:
+                log_error(f"[RECONNECT][{acc_name}] Неожиданная ошибка: {type(e).__name__}: {e}. Перезапуск через 10с...")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(10)
     finally:
+        watchdog.cancel()
         broadcaster.stop()
+        release_instance_lock(lock_key)
 
 async def main():
     accounts = CONFIG.get("accounts", [])
@@ -4029,7 +4842,11 @@ async def main():
     print("=" * 55)
 
     tasks = [run_single_account(acc) for acc in valid_accounts]
-    await asyncio.gather(*tasks)
+    # return_exceptions: one broken account must not take the others down.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for acc, res in zip(valid_accounts, results):
+        if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
+            log_error(f"[FATAL][{acc.get('name')}] {type(res).__name__}: {res}")
 
 if __name__ == "__main__":
     try:

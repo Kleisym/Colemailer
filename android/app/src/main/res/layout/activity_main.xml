@@ -179,6 +179,17 @@
             android:textColor="@color/teal_200"
             app:strokeColor="@color/teal_200" />
 
+        <Button
+            android:id="@+id/btnAutostart"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="🔁 Автозапуск и работа в фоне"
+            android:textAllCaps="false"
+            android:textColor="@color/teal_200"
+            app:strokeColor="@color/teal_200" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

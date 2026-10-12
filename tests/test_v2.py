@@ -95,7 +95,7 @@ class _SendClient:
     async def get_input_entity(self, peer):
         return peer
 
-    async def send_message(self, peer, message=None, formatting_entities=None):
+    async def send_message(self, peer, message=None, formatting_entities=None, **kw):
         n = len(self.sent) + 1
         if self.fail_with is not None and (self.fail_on_call is None or self.fail_on_call == n):
             raise self.fail_with
@@ -153,7 +153,7 @@ class TestNoDuplicateSends(_DBCase):
         async def scenario():
             async with b._chat_lock(4):
                 return await b._send_task(1, 4, "p")
-        self.assertEqual(asyncio.run(scenario()), "skip")
+        self.assertEqual(asyncio.run(scenario()), "busy")
 
     def test_legacy_rows_are_adopted_by_one_account(self):
         self.db.add_or_update_broadcast(chat_id=1, template_name="old", mode="interval", interval_seconds=60, account_id=0)

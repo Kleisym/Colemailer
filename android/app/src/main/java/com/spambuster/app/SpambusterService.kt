@@ -1,5 +1,6 @@
 package com.spambuster.app
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,13 +9,18 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import kotlin.concurrent.thread
@@ -24,6 +30,8 @@ class SpambusterService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var heartbeat: Runnable? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastKickAt = 0L
 
     companion object {
         const val CHANNEL_ID = "spambuster_service_channel"
@@ -36,6 +44,63 @@ class SpambusterService : Service() {
         private const val WAKE_LOCK_TAG = "Spambuster::RuntimeWakeLock"
         private const val MIN_RUNTIME_FOR_RESTART_MS = 60_000L
         private const val RESTART_DELAY_MS = 10_000L
+        const val ACTION_KEEPALIVE = "com.spambuster.app.ACTION_KEEPALIVE"
+        private const val KEEPALIVE_INTERVAL_MS = 10 * 60_000L
+        private const val KEEPALIVE_REQUEST_CODE = 4242
+        private const val WIFI_LOCK_TAG = "Spambuster::WifiLock"
+
+        @Volatile
+        var stopInProgress = false
+
+        @Volatile
+        var restartRequested = false
+
+        @Volatile
+        var runtimeWifiLock: WifiManager.WifiLock? = null
+
+        private fun keepAlivePendingIntent(context: Context, flags: Int): PendingIntent? {
+            val intent = Intent(context, KeepAliveReceiver::class.java).apply {
+                action = ACTION_KEEPALIVE
+            }
+            return PendingIntent.getBroadcast(
+                context, KEEPALIVE_REQUEST_CODE, intent,
+                flags or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        /**
+         * Doze-proof wake-up. Handler/asyncio timers freeze while the phone is
+         * in Doze, so an alarm that is allowed to fire while idle pokes the
+         * service every ~10 minutes, re-checks the Telegram socket and
+         * restarts the bot if Android killed its thread.
+         */
+        fun scheduleKeepAlive(context: Context, delayMs: Long = KEEPALIVE_INTERVAL_MS) {
+            try {
+                val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val pi = keepAlivePendingIntent(context, PendingIntent.FLAG_UPDATE_CURRENT) ?: return
+                val at = SystemClock.elapsedRealtime() + delayMs
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi)
+                } else {
+                    am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi)
+                }
+            } catch (e: Exception) {
+                // best effort
+            }
+        }
+
+        fun cancelKeepAlive(context: Context) {
+            try {
+                val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val pi = keepAlivePendingIntent(context, PendingIntent.FLAG_NO_CREATE)
+                if (pi != null) {
+                    am.cancel(pi)
+                    pi.cancel()
+                }
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
 
         @Volatile
         var activePythonThread: Thread? = null
@@ -55,6 +120,7 @@ class SpambusterService : Service() {
             stopForegroundService()
             return START_NOT_STICKY
         }
+        val isKeepAlive = intent?.action == ACTION_KEEPALIVE
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         // A null intent means the system restarted us after killing the
@@ -66,7 +132,12 @@ class SpambusterService : Service() {
             return START_NOT_STICKY
         }
 
-        if (!restartingFromOemKill) {
+        if (isKeepAlive && !prefs.getBoolean(KEY_SERVICE_ENABLED, false)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (!restartingFromOemKill && !isKeepAlive) {
             prefs.edit().putBoolean(KEY_SERVICE_ENABLED, true).apply()
         }
 
@@ -81,13 +152,28 @@ class SpambusterService : Service() {
             // (e.g. a sticky restart on some OEM firmwares). Crashing here used
             // to take the whole app down; retry on the next start instead.
             updateStatusAndNotification("Android не разрешил фоновый запуск. Откройте приложение.", false)
+            // Try again later from the keep-alive alarm instead of dying for good.
+            scheduleKeepAlive(applicationContext, 60_000L)
             stopSelf()
             return START_NOT_STICKY
         }
 
         acquireRuntimeWakeLock()
+        acquireWifiLock()
+        registerNetworkCallback()
         startHeartbeat()
-        startPythonBot()
+        scheduleKeepAlive(applicationContext)
+
+        val alive = activePythonThread?.isAlive == true
+        if (alive && stopInProgress && !isKeepAlive) {
+            // "Старт" pressed while the previous run is still shutting down:
+            // start again as soon as that thread exits.
+            restartRequested = true
+        } else if (alive && isKeepAlive) {
+            kickBridge()
+        } else {
+            startPythonBot()
+        }
 
         return START_STICKY
     }
@@ -113,6 +199,79 @@ class SpambusterService : Service() {
         } catch (e: Exception) {
             // Wake lock unavailable: the foreground service still keeps the
             // process alive, only CPU-idle hibernation stays possible.
+        }
+    }
+
+    /**
+     * Keep Wi-Fi at full power while the screen is off. Without it many phones
+     * drop Wi-Fi to a power-save mode (or turn it off) and the Telegram socket
+     * silently dies until the user opens the app again.
+     */
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (runtimeWifiLock?.isHeld == true) return
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            runtimeWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            // no Wi-Fi on this device / not allowed
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            runtimeWifiLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+            // ignore
+        }
+        runtimeWifiLock = null
+    }
+
+    /** Reconnect immediately when the phone switches networks or gets one back. */
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    kickBridge()
+                }
+            }
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (e: Exception) {
+            networkCallback = null
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    /** Ask the Python supervisor for an immediate health check (debounced). */
+    private fun kickBridge() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastKickAt < 3_000L) return
+        lastKickAt = now
+        if (activePythonThread?.isAlive != true) return
+        thread(name = "Spambuster-Kick") {
+            try {
+                if (Python.isStarted()) {
+                    Python.getInstance().getModule("bot_bridge").callAttr("kick")
+                }
+            } catch (e: Throwable) {
+                // ignore
+            }
         }
     }
 
@@ -177,6 +336,8 @@ class SpambusterService : Service() {
                 return
             }
 
+            stopInProgress = false
+            restartRequested = false
             val startedAt = System.currentTimeMillis()
             activePythonThread = thread(name = "Spambuster-Python-Thread") {
                 try {
@@ -255,6 +416,23 @@ class SpambusterService : Service() {
      */
     private fun scheduleRestartIfNeeded(startedAt: Long) {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (restartRequested) {
+            restartRequested = false
+            stopInProgress = false
+            if (prefs.getBoolean(KEY_SERVICE_ENABLED, false)) {
+                mainHandler.postDelayed({
+                    try {
+                        ContextCompat.startForegroundService(
+                            applicationContext,
+                            Intent(applicationContext, SpambusterService::class.java)
+                        )
+                    } catch (e: Exception) {
+                        startPythonBot()
+                    }
+                }, 1_000L)
+            }
+            return
+        }
         if (!prefs.getBoolean(KEY_SERVICE_ENABLED, false)) return
         val ranFor = System.currentTimeMillis() - startedAt
         if (ranFor < MIN_RUNTIME_FOR_RESTART_MS) return
@@ -338,6 +516,11 @@ class SpambusterService : Service() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(KEY_SERVICE_ENABLED, false).apply()
 
+        stopInProgress = activePythonThread?.isAlive == true
+        restartRequested = false
+        cancelKeepAlive(applicationContext)
+        unregisterNetworkCallback()
+        releaseWifiLock()
         stopHeartbeat()
         BotBridgeCoordinator.cancelWait()
 
@@ -375,9 +558,24 @@ class SpambusterService : Service() {
         // memory. Clearing KEY_SERVICE_ENABLED there meant the service could
         // never come back after the very kills we need it to survive.
         stopHeartbeat()
+        unregisterNetworkCallback()
+        releaseWifiLock()
         releaseRuntimeWakeLock()
         wakeLock?.let { if (it.isHeld) it.release() }
+        if (getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, false)) {
+            // Killed by the system/OEM while it should be running: come back soon.
+            scheduleKeepAlive(applicationContext, 30_000L)
+        }
         super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping the app away from "recent apps" kills the process on MIUI,
+        // EMUI, ColorOS... Schedule a restart so the bot comes back by itself.
+        if (getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, false)) {
+            scheduleKeepAlive(applicationContext, 5_000L)
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -375,10 +375,10 @@ class TestAntispamProject(unittest.TestCase):
             async def forward_messages(self, chat_peer, messages, from_peer):
                 self.forwarded.append({"chat": chat_peer, "messages": messages, "from_peer": from_peer})
 
-            async def send_message(self, chat_peer, message, formatting_entities=None):
+            async def send_message(self, chat_peer, message, formatting_entities=None, **kw):
                 self.sent_messages.append({"chat": chat_peer, "message": message, "entities": formatting_entities})
 
-            async def send_file(self, chat_peer, file, caption=None, formatting_entities=None):
+            async def send_file(self, chat_peer, file, caption=None, formatting_entities=None, **kw):
                 self.sent_files.append({"chat": chat_peer, "file": file, "caption": caption})
 
         client = MockTelegramClient()
@@ -840,7 +840,7 @@ auto_sub_enabled = false
         class MockClient:
             def __init__(self):
                 self.messages = []
-            async def send_message(self, chat_peer, message, formatting_entities=None):
+            async def send_message(self, chat_peer, message, formatting_entities=None, **kw):
                 if not message:
                     raise ValueError("Cannot send empty message")
                 self.messages.append(message)
