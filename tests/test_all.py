@@ -988,13 +988,13 @@ auto_sub_enabled = false
 
         # 1st call registers handlers
         register_events(client, broadcaster, my_id=888)
-        self.assertEqual(len(registered), 2)
+        self.assertEqual(len(registered), 3)
         self.assertTrue(getattr(client, "_spambuster_events_registered", False))
         self.assertIs(client._spambuster_broadcaster, broadcaster)
 
         # 2nd call does NOT register duplicate handlers
         register_events(client, broadcaster, my_id=888)
-        self.assertEqual(len(registered), 2)
+        self.assertEqual(len(registered), 3)
 
     def test_is_internal_bot_message(self):
         # The exact message the user saw

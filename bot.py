@@ -1866,6 +1866,42 @@ def _strip_mentions(text: str) -> str:
     return re.sub(r"@[A-Za-z0-9_]{3,32}", " ", text or "").strip()
 
 
+def _advertising_metadata(message: Any) -> str:
+    """Visible button labels and hidden link targets; never fetch remote content."""
+    if message is None:
+        return ""
+    values = []
+    for ent in (getattr(message, "entities", None) or []):
+        url = getattr(ent, "url", None)
+        if isinstance(url, str):
+            values.append(url[:2048])
+    markup = getattr(message, "reply_markup", None)
+    for row in (getattr(markup, "rows", None) or [])[:20]:
+        for button in (getattr(row, "buttons", None) or [])[:10]:
+            for obj, field in ((button, "text"), (button, "url"),
+                               (getattr(button, "type", None), "url")):
+                value = getattr(obj, field, None)
+                if isinstance(value, str):
+                    values.append(value[:2048])
+    return "\n".join(dict.fromkeys(values))[:16000]
+
+
+# Require prices attached to catalogue rows, not arbitrary dates/phone numbers.
+_CATALOG_PRICE_ROW_RE = re.compile(
+    r"(?:\(\+?\d{1,4}\)|\b(?:19|20)\d{2}\b|[а-яa-z]{3,})"
+    r"[^\n]{0,60}?\s[-–—:=]\s*\d+(?:[.,]\d+)?\s*(?:[⭐🌟]|звезд\w*|₽|руб\w*|ton\b|\$|€)?\s*$",
+    re.IGNORECASE,
+)
+_SELLER_HEADER_RE = re.compile(
+    r"\b(?:в\s+продаже|прайс(?:[- ]лист)?|актуальн\w*\s+(?:цен\w*|прайс\w*)|наличие|каталог|price\s*list)\b",
+    re.IGNORECASE,
+)
+_CONTACT_SECTION_RE = re.compile(
+    r"\b(?:купить|заказать|отзывы|обратная\s+связь|для\s+заказа|контакты|reviews|order|contact)\b",
+    re.IGNORECASE,
+)
+
+
 def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str] = None) -> Tuple[int, str, List[str]]:
     """
     Returns (score, primary_trigger, matched_factors). Spam when score >= 50.
@@ -1877,7 +1913,8 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     """
     if ping_kind == "stealth":
         return 100, "stealth_ping", ["hidden_mention_without_username_or_reply"]
-    if not text:
+    metadata = _advertising_metadata(message)
+    if not text and not metadata:
         if message is not None and getattr(message, "via_bot_id", None):
             return 100, "sent_via_inline_bot", ["inline_bot"]
         return 0, "", []
@@ -1886,8 +1923,8 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if hard:
         return 100, hard[0], [hard[1]]
 
-    clean, obf = normalize_text(text)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    clean, obf = normalize_text((text or "") + ("\n" + metadata if metadata else ""))
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     factors: List[str] = []
     score = 0
 
@@ -1956,6 +1993,18 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if len(foreign_handles) >= 2:
         add(15, f"multiple_usernames_{len(foreign_handles)}")
 
+    catalogue_rows = sum(bool(_CATALOG_PRICE_ROW_RE.search(normalize_text(line)[0])) for line in lines)
+    seller_header = bool(_SELLER_HEADER_RE.search(clean))
+    contact_section = bool(_CONTACT_SECTION_RE.search(clean)) and bool(links or foreign_handles)
+    # Flags and a long message alone are not a shop: travel lists stay readable.
+    catalogue_offer = catalogue_rows >= 2 and (has_sale_verb or seller_header or contact_section)
+    if catalogue_offer:
+        add(60, "seller_price_catalogue")
+    if contact_section and (commercial_core or catalogue_offer or seller_header):
+        add(25, "seller_contact_section")
+    if re.search(r"переслано\s+через\s+\w+", clean) and (commercial_core or catalogue_offer):
+        add(15, "commercial_forwarder")
+
     prices = _PRICE_RE.findall(clean)
     if len(prices) >= 2:
         add(20, f"price_list_{len(prices)}")
@@ -2001,7 +2050,7 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if _CONVO_RE.search(clean) and not (has_emoji_routing or bullets):
         damp += 15
         factors.append("conversational_markers(-15)")
-    if has_seller_ask or combo or obf:
+    if has_seller_ask or combo or obf or catalogue_offer:
         cap = 0
     elif strong_topic:
         cap = 10
@@ -2011,7 +2060,7 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
         cap = 40
     score = max(0, score - min(damp, cap))
 
-    if is_genuine_buyer_question(text):
+    if not metadata and not catalogue_offer and is_genuine_buyer_question(text):
         score = 0
         factors.append("genuine_buyer_question(veto)")
 
@@ -2091,18 +2140,28 @@ def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = N
     """
     Auto-clear gate.
 
-    Hard structural spam (hidden tags, inline bots, autoposter watermarks,
-    stealth pings) is always cleared. Heuristic advertising is cleared only
-    when it pinged us (is_ping=True) or no ping context was given. A real buyer
-    question is never cleared.
+    Hard structural spam is cleared. For messages without a ping, require
+    high-confidence sale + contact evidence or a seller price catalogue.
+    Regular buyer questions are preserved; history clearing has a separate
+    unread-message safety check.
     """
     hard, _ = is_hard_spam(text, message, ping_kind=ping_kind)
     if hard:
         return True
-    if is_genuine_buyer_question(text):
+    metadata = _advertising_metadata(message)
+    if not metadata and is_genuine_buyer_question(text):
         return False
     if is_ping is False:
-        return False
+        # Ordinary group notifications need no mention. Use a stricter gate:
+        # score alone (flags/layout/obfuscation) must not silence conversation.
+        score, _trigger, factors = calculate_spam_score(text, message)
+        labels = {f.split("(", 1)[0] for f in factors}
+        catalogue = "seller_price_catalogue" in labels
+        sale = bool(labels & {"sale_verb", "seller_ask"})
+        contact = bool(labels & {"seller_contact_section", "text_seller_routing",
+                                  "emoji_contact_routing", "dm_call_to_action",
+                                  "foreign_handle", "promo_links"})
+        return score >= 80 and (catalogue or (contact and (sale or "commercial_combo" in labels)))
     # A stranger tagging us on a picture/video with (almost) no text and not as
     # a reply to our post: the ad is in the image. Real buyers ask in words.
     if ping_kind == "name":
@@ -2629,12 +2688,48 @@ async def _resolve_input_peer(client: TelegramClient, chat_peer: Any, message: A
         return None
 
 
+async def _safe_to_read_ad_history(client: TelegramClient, input_peer: Any, msg_id: int) -> bool:
+    """Telegram cannot read just one history item. Fail closed on any doubt.
+
+    Inspect at most 50 preceding unread messages, including after a restart;
+    do not wipe conversations/mentions or an unbounded backlog to hide an ad.
+    """
+    from telethon.tl.functions.messages import GetPeerDialogsRequest
+    from telethon.tl.types import InputDialogPeer
+    try:
+        result = await client(GetPeerDialogsRequest(peers=[InputDialogPeer(peer=input_peer)]))
+        if not getattr(result, "dialogs", None):
+            return False
+        dialog = result.dialogs[0]
+        read_max = dialog.read_inbox_max_id
+        if read_max >= msg_id:
+            return False  # Never re-read old edits.
+        if getattr(dialog, "unread_count", 51) > 50:
+            return False
+        previous = await client.get_messages(input_peer, min_id=read_max, max_id=msg_id, limit=51)
+        if previous is None or len(previous) > 50:
+            return False
+        for item in previous:
+            if getattr(item, "out", False):
+                continue
+            if getattr(item, "mentioned", False):
+                return False  # Preserve unknown genuine pings across restarts.
+            body = getattr(item, "message", "") or ""
+            if not should_auto_read(body, item, is_ping=False):
+                return False
+        return True
+    except Exception as exc:
+        log_info(f"[ANTISPAM] История не тронута: не удалось проверить непрочитанные ({type(exc).__name__}).")
+        return False
+
+
 async def clear_spam_mention(
     client: TelegramClient,
     chat_peer: Any,
     message: Any,
     account_id: int = 0,
     chat_id: Optional[int] = None,
+    protect_unread_history: bool = False,
 ):
     """
     Silence one spam ping that reached us.
@@ -2672,6 +2767,9 @@ async def clear_spam_mention(
             await client(MessagesReadContentsRequest(id=[msg_id]))
     except Exception:
         pass
+
+    if protect_unread_history and not await _safe_to_read_ad_history(client, input_peer, msg_id):
+        return
 
     # Is a real ping in this chat still unread? Then leave the history alone.
     key_chat = chat_id if chat_id is not None else getattr(message, "chat_id", None)
@@ -3124,7 +3222,8 @@ HELP_TEXT = """
 • `.просмотр все` / `.view all` — список всех рассылок и чередований в этом чате
 
 **8. Антиспам и авто-подписка:**
-• Гасит только те спам-сообщения, которые **пинганули тебя**: упоминание `@юзернейма`, ответ на твой пост, упоминание по имени, а также **скрытый пинг** (тег без юзернейма и без ответа — всегда считается спамом).
+• Гасит спам-пинги и явную рекламу **без упоминания**: прайсы, продажу с контактами, рекламные ссылки и скрытые теги. Проверяет также правки сообщений и ссылки в кнопках.
+• Не читает историю ради рекламы без пинга, если выше остались обычные непрочитанные сообщения или проверить их не удалось. Текст внутри картинок не распознаётся; звук push-уведомления может успеть проиграть до обработки.
 • Медиа (фото/видео) с пингом и рекламной подписью или почти без текста — спам.
 • Понимает обфускацию: латиница вместо кириллицы (`3вёзды`, `zвезды`), буквы через точки/пробелы, «красивые» шрифты, транслит.
 • Ловит скупку/продажу звёзд, TON, NFT-подарков, Premium/бустов, юзов, аккаунтов, «заработок», казино, накрутку, 18+, мошенничество, рекламу каналов и вотермарки автопостеров.
@@ -3447,6 +3546,9 @@ async def classify_ping(event: Any, message: Any, text: str, my_id: int,
     if not mentioned and not typed_username and ent_kind is None:
         return None
 
+    if ent_kind == "hidden":
+        return "stealth"
+
     reply_unknown = False
     if getattr(event, "is_reply", False):
         try:
@@ -3541,11 +3643,12 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             ping_kind = "unknown" if getattr(message, "mentioned", False) else None
         is_ping = ping_kind is not None
 
-        if auto_read_spam and is_ping:
+        if auto_read_spam:
             target_peer = getattr(event, "input_chat", None) or chat_id
-            if should_auto_read(text, message, is_ping=True, ping_kind=ping_kind if ping_kind != "unknown" else None):
-                await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id)
-            else:
+            if should_auto_read(text, message, is_ping=is_ping, ping_kind=ping_kind if ping_kind != "unknown" else None):
+                await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id,
+                                         protect_unread_history=not is_ping)
+            elif is_ping:
                 note_genuine_ping(my_id, chat_id, msg_id or 0)
 
         if auto_sub and is_gatekeeper_text(text):
@@ -3571,6 +3674,31 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                         await event.message.click(*verify_coords)
                     except Exception:
                         pass
+
+    @client.on(events.MessageEdited(incoming=True))
+    async def edited_spam_handler(event: Any):
+        # Spammers can add ads/hidden mentions after a harmless first message.
+        # Do not touch counter broadcasts, subscriptions, or new-message dedup.
+        if not auto_read_spam or event.is_private:
+            return
+        sender_id = event.sender_id
+        if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
+            return
+        if is_peer_muted(my_id, sender_id, event.chat_id):
+            return
+        text = event.raw_text or ""
+        message = event.message
+        try:
+            kind = await classify_ping(event, message, text, my_id, my_usernames, my_names)
+        except Exception:
+            kind = "unknown" if getattr(message, "mentioned", False) else None
+        if should_auto_read(text, message, is_ping=kind is not None,
+                            ping_kind=kind if kind != "unknown" else None):
+            await clear_spam_mention(client, getattr(event, "input_chat", None) or event.chat_id,
+                                     message, account_id=my_id, chat_id=event.chat_id,
+                                     protect_unread_history=True)
+        elif kind is not None:
+            note_genuine_ping(my_id, event.chat_id, event.id)
 
     @client.on(events.NewMessage())
     async def command_dispatcher(event: Any):
