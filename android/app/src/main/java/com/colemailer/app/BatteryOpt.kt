@@ -87,7 +87,7 @@ object BatteryOpt {
             .setData(Uri.parse("package:" + context.packageName))
     }
 
-    /** Чек-лист для экрана «Работа в фоне». */
+    /** Чек-лист для экрана «Работа в фоне». Все четыре пункта проверяются кодом. */
     fun report(context: Context): List<Check> = listOf(
         Check(
             context.getString(R.string.check_notifications),
@@ -100,14 +100,14 @@ object BatteryOpt {
             requestExemption(context)
         ),
         Check(
+            context.getString(R.string.check_exact_alarms),
+            exactAlarmsAllowed(context),
+            requestExactAlarms(context)
+        ),
+        Check(
             context.getString(R.string.check_background),
             !isBackgroundRestricted(context) && isRunInBackgroundAllowed(context),
             appDetails(context)
-        ),
-        Check(
-            context.getString(R.string.check_autostart),
-            OemAutostart.assumeEnabled(),
-            OemAutostart.bestIntent(context) ?: appDetails(context)
         )
     )
 

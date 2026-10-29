@@ -1,7 +1,13 @@
 package com.colemailer.app.ui
 
 import android.os.Bundle
+import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import com.colemailer.app.PermissionFlow
 import com.colemailer.app.R
@@ -24,7 +30,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Android 15 рисует приложение под статус-баром; без явных inset'ов
+        // заголовок уезжал под часы и выглядел «сломанным».
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
+        applyWindowInsets()
 
         // Регистрация ActivityResultLauncher'ов должна произойти до STARTED.
         permissionFlow = PermissionFlow(this)
@@ -56,11 +66,30 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        if (savedInstanceState == null) {
-            bottomNav.selectedItemId = R.id.nav_home
-        }
+        // При повороте восстанавливаем вкладку, иначе контейнер остаётся пустым:
+        // listener не вызывается, пока не выбрать item программно.
+        bottomNav.selectedItemId = savedInstanceState?.getInt(KEY_TAB, R.id.nav_home)
+            ?: R.id.nav_home
 
         permissionFlow.startOnFirstLaunch()
+    }
+
+    private fun applyWindowInsets() {
+        val root = findViewById<View>(R.id.root)
+        val container = findViewById<View>(R.id.fragment_container)
+        val nav = findViewById<View>(R.id.bottom_nav)
+        WindowInsetsControllerCompat(window, window.decorView).isAppearanceLightStatusBars = false
+        WindowInsetsControllerCompat(window, window.decorView).isAppearanceLightNavigationBars = false
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            container.updatePadding(top = bars.top)
+            nav.updatePadding(bottom = bars.bottom)
+            // Клавиатура не должна закрывать поля ввода на экране «Подключение».
+            container.updatePadding(bottom = if (ime.bottom > bars.bottom) ime.bottom else 0)
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

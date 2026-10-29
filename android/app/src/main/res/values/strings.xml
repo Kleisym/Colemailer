@@ -56,12 +56,18 @@
     <!-- Чек-лист фона -->
     <string name="check_notifications">Уведомления разрешены</string>
     <string name="check_battery">Оптимизация батареи отключена</string>
+    <string name="check_exact_alarms">Точные будильники разрешены</string>
     <string name="check_background">Фоновая активность не ограничена</string>
     <string name="check_autostart">Автозапуск включён (отметка вручную)</string>
     <string name="btn_open_autostart">Открыть экран автозапуска</string>
     <string name="btn_mark_autostart">Отметить как включённый</string>
     <string name="btn_app_details">Настройки приложения</string>
+    <string name="btn_root_grants">Выдать всё через root</string>
     <string name="state_note_autostart">Без автозапуска сервис не поднимется после перезагрузки и свайпа</string>
+    <string name="toast_root_checking">Проверяю root…</string>
+    <string name="toast_root_unavailable">Root не найден — выдам через системные диалоги</string>
+    <string name="toast_root_ok">Готово: права выданы через root</string>
+    <string name="toast_root_failed">Root есть, но команды не прошли. Показываю лог в списке</string>
 
     <!-- Подключение -->
     <string name="connect_title">Подключение</string>

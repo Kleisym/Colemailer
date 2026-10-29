@@ -133,6 +133,14 @@
                     android:text="@string/btn_fix" />
 
                 <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_root_grants"
+                    style="@style/Widget.Colemailer.Button.Outlined"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/btn_root_grants" />
+
+                <com.google.android.material.button.MaterialButton
                     android:id="@+id/btn_open_autostart"
                     style="@style/Widget.Colemailer.Button.Outlined"
                     android:layout_width="match_parent"

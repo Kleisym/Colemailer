@@ -1,5 +1,10 @@
 package com.colemailer.app
 
+import android.content.Context
+import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import com.colemailer.app.ui.AuthActivity
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -42,6 +47,7 @@ object AuthQueue {
         val context = App.context
         StatusStore.setPhase(phaseOf(kind), title, running = true)
         Notifications.authRequest(context, kind, title, hint)
+        openAuthScreen(context, kind, title, hint)
 
         val received = try {
             request.latch.await(timeoutMs, TimeUnit.MILLISECONDS)
@@ -62,6 +68,23 @@ object AuthQueue {
                 Level.WARN
             )
             ""
+        }
+    }
+
+    /**
+     * Показать экран ввода поверх текущего. Из фона Android может запретить
+     * запуск Activity — тогда остаётся уведомление, но в открытом приложении
+     * диалог появляется сразу, а не «через три минуты таймаута».
+     */
+    private fun openAuthScreen(context: Context, kind: Kind, title: String, hint: String) {
+        val mode = if (kind == Kind.CODE) AuthActivity.MODE_CODE else AuthActivity.MODE_PASSWORD
+        val intent = Intent(context, AuthActivity::class.java)
+            .putExtra(AuthActivity.EXTRA_MODE, mode)
+            .putExtra(AuthActivity.EXTRA_TITLE, title)
+            .putExtra(AuthActivity.EXTRA_HINT, hint)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        Handler(Looper.getMainLooper()).post {
+            runCatching { context.startActivity(intent) }
         }
     }
 

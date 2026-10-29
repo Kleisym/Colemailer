@@ -118,10 +118,17 @@ class MyTelegramAuth:
     def __init__(self, timeout: float = 30.0, opener: Optional[urllib.request.OpenerDirector] = None):
         self.timeout = timeout
         self._jar = http.cookiejar.CookieJar()
-        self._opener = opener or urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._jar)
-        )
         self._ssl = _ssl_context()
+        if opener is not None:
+            self._opener = opener
+        else:
+            handlers: list = [urllib.request.HTTPCookieProcessor(self._jar)]
+            if self._ssl is not None:
+                # context передаётся в HTTPSHandler при сборке opener:
+                # OpenerDirector.open() такого аргумента не принимает
+                # (именно на этом падало авто-получение в APK).
+                handlers.append(urllib.request.HTTPSHandler(context=self._ssl))
+            self._opener = urllib.request.build_opener(*handlers)
         self.phone: str = ""
         self.random_hash: str = ""
         self.authorized: bool = False
@@ -141,10 +148,7 @@ class MyTelegramAuth:
             headers["X-Requested-With"] = "XMLHttpRequest"
         request = urllib.request.Request(url, data=body, headers=headers)
         try:
-            kwargs = {"timeout": self.timeout}
-            if self._ssl is not None:
-                kwargs["context"] = self._ssl
-            with self._opener.open(request, **kwargs) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 raw = response.read()
                 charset = response.headers.get_content_charset() or "utf-8"
                 return raw.decode(charset, errors="replace")
@@ -207,8 +211,16 @@ class MyTelegramAuth:
 
     def _verify_session(self) -> None:
         page = self._open(f"{SITE}/apps")
-        if "send_password" in page or "auth/login" in page:
+        low = page.lower()
+        # После входа на /apps есть раздел API development tools и поля api_id.
+        # Страница логина, наоборот, содержит форму /auth/send_password.
+        if "api development tools" in low or "app api_id" in low:
+            self.authorized = True
+            return
+        if 'action="/auth/send_password"' in low or 'action="/auth/login"' in low or "send_password" in low:
             raise ApiAuthError("вход не подтвердился, попробуй ещё раз")
+        # Неизвестная разметка: не считаем вход провалившимся, дальше проверит
+        # fetch_app()/create_app().
         self.authorized = True
 
     def fetch_app(self) -> Optional[Dict[str, object]]:

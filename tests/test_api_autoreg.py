@@ -130,6 +130,30 @@ def make_auth(opener):
     return auth
 
 
+class StrictOpener:
+    """Как настоящий OpenerDirector: open() принимает только timeout.
+
+    Именно на этом падало авто-получение в APK: context — аргумент
+    urlopen(), а не opener.open(). Тест не даёт вернуть эту ошибку.
+    """
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def open(self, request, timeout=None):
+        self.calls.append(request.full_url)
+        return _Response(self.payload)
+
+
+def test_transport_never_passes_context_to_the_opener():
+    opener = StrictOpener('{"random_hash": "abc123"}')
+    auth = MyTelegramAuth(opener=opener)
+    auth.send_code("+79991234567")
+    assert auth.random_hash == "abc123"
+    assert opener.calls == ["https://my.telegram.org/auth/send_password"]
+
+
 # --------------------------------------------------------------------------- #
 # вход по коду
 # --------------------------------------------------------------------------- #

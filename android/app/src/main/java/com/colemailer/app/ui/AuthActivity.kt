@@ -5,6 +5,10 @@ import android.text.InputType
 import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import com.colemailer.app.AuthQueue
 import com.colemailer.app.R
 import com.google.android.material.button.MaterialButton
@@ -33,7 +37,22 @@ class AuthActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_auth)
+
+        val root = findViewById<View>(R.id.auth_root)
+        val baseTop = root.paddingTop
+        val baseBottom = root.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            view.updatePadding(
+                top = baseTop + bars.top,
+                bottom = baseBottom + maxOf(bars.bottom, ime.bottom)
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
 
         val title = findViewById<TextView>(R.id.tv_auth_title)
         val description = findViewById<TextView>(R.id.tv_auth_hint)

@@ -6,82 +6,160 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Мастер «чтобы работало в фоне».
  *
- * Шаги идут в жёстком порядке: уведомления (диалог ОС) -> exemption от
- * battery optimization (диалог ОС) -> экран автозапуска вендора ->
- * «Настройки приложения», если фон всё равно ограничен. Показывается не один
- * раз в жизни, а при каждом запуске, пока хоть один шаг не закрыт.
+ * Шаги идут по цепочке и сами продолжаются после возврата из системного
+ * экрана: уведомления -> exemption от battery optimization -> точные будильники
+ * -> ограничение фона -> автозапуск вендора. Повторно один и тот же экран за
+ * один проход не открывается (иначе после возврата был бы бесконечный цикл).
+ * Если на устройстве есть root, всё это можно выдать одной кнопкой в
+ * настройках — см. [RootShell].
  */
 class PermissionFlow(private val activity: AppCompatActivity) {
+
+    private var askedNotifications = false
+    private var askedBattery = false
+    private var askedExact = false
+    private var askedDetails = false
+    private var askedAutostart = false
 
     private val notificationLauncher = activity.registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (!granted) {
-            Toast.makeText(
-                activity,
-                R.string.toast_notifications_denied,
-                Toast.LENGTH_LONG
-            ).show()
+            Toast.makeText(activity, R.string.toast_notifications_denied, Toast.LENGTH_LONG).show()
         }
-        openBatteryStep()
+        requestNext()
+    }
+
+    private val batteryLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { requestNext() }
+
+    private val exactLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { requestNext() }
+
+    private val detailsLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { requestNext() }
+
+    private val autostartLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        // Экран вендора вернул управление — считаем, что пользователь его видел.
+        OemAutostart.confirm()
+        requestNext()
     }
 
     /** Первый запуск: сразу ведём по шагам, не дожидаясь нажатия «Старт». */
     fun startOnFirstLaunch() {
         if (Prefs.onboardingDone) return
         Prefs.onboardingDone = true
+        resetAsked()
+        // На рутованных устройствах сначала пробуем выдать всё молча.
+        activity.lifecycleScope.launch {
+            val rooted = withContext(Dispatchers.IO) {
+                if (RootShell.isAvailable()) {
+                    RootShell.grantAll(activity.applicationContext)
+                } else {
+                    null
+                }
+            }
+            if (rooted?.ok == true) {
+                Toast.makeText(activity, R.string.toast_root_ok, Toast.LENGTH_LONG).show()
+            } else {
+                requestNext()
+            }
+        }
+    }
+
+    /** Кнопка «Исправить»: начинает проход заново. */
+    fun requestAll() {
+        resetAsked()
         requestNext()
     }
 
     /** Открыть первый нерешённый шаг. */
     fun requestNext() {
-        if (!Notifications.granted(activity) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (!Notifications.granted(activity) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotifications) {
+            askedNotifications = true
             notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             return
         }
-        if (!BatteryOpt.isIgnoring(activity)) {
+        if (!BatteryOpt.isIgnoring(activity) && !askedBattery) {
+            askedBattery = true
             openBatteryStep()
             return
         }
-        if (!BatteryOpt.exactAlarmsAllowed(activity)) {
+        if (!BatteryOpt.exactAlarmsAllowed(activity) && !askedExact) {
             // Без точного будильника время рассылки сдвигается на десятки
             // минут (остаётся только страховка WorkManager).
+            askedExact = true
             openExactAlarms()
             return
         }
-        if (!OemAutostart.assumeEnabled()) {
-            openAutostart()
+        if ((BatteryOpt.isBackgroundRestricted(activity) || !BatteryOpt.isRunInBackgroundAllowed(activity)) && !askedDetails) {
+            askedDetails = true
+            openAppDetails()
             return
         }
-        if (!BatteryOpt.isBackgroundRestricted(activity) && BatteryOpt.isRunInBackgroundAllowed(activity)) {
-            openAppDetails()
+        if (!OemAutostart.assumeEnabled() && !askedAutostart) {
+            askedAutostart = true
+            openAutostart()
         }
     }
 
     fun openBatteryStep() {
         val intent = BatteryOpt.requestExemption(activity)
-        if (!start(intent)) {
+        if (!launchForResult(batteryLauncher, intent)) {
             start(BatteryOpt.batterySettings(activity))
         }
     }
 
     fun openAutostart() {
-        val opened = OemAutostart.open(activity)
-        if (!opened) {
-            Toast.makeText(activity, R.string.toast_no_autostart_screen, Toast.LENGTH_LONG).show()
+        val intent = OemAutostart.bestIntent(activity)
+        if (intent == null || !launchForResult(autostartLauncher, intent)) {
+            if (!OemAutostart.open(activity)) {
+                Toast.makeText(activity, R.string.toast_no_autostart_screen, Toast.LENGTH_LONG).show()
+            }
         }
     }
 
     fun openAppDetails() {
-        start(BatteryOpt.appDetails(activity))
+        if (!launchForResult(detailsLauncher, BatteryOpt.appDetails(activity))) {
+            start(BatteryOpt.appDetails(activity))
+        }
     }
 
     fun openExactAlarms() {
-        start(BatteryOpt.requestExactAlarms(activity))
+        if (!launchForResult(exactLauncher, BatteryOpt.requestExactAlarms(activity))) {
+            start(BatteryOpt.requestExactAlarms(activity))
+        }
+    }
+
+    private fun resetAsked() {
+        askedNotifications = false
+        askedBattery = false
+        askedExact = false
+        askedDetails = false
+        askedAutostart = false
+    }
+
+    private fun launchForResult(
+        launcher: androidx.activity.result.ActivityResultLauncher<Intent>,
+        intent: Intent
+    ): Boolean = try {
+        launcher.launch(intent)
+        true
+    } catch (e: Exception) {
+        false
     }
 
     private fun start(intent: Intent): Boolean = try {

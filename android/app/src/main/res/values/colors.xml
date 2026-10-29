@@ -1,36 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Палитра dark-first. Светлая тема не делается отдельным экраном:
-     приложение рассчитано на «висит в фоне», тёмный фон экономит батарею. -->
+<!-- Красно-чёрная палитра dark-first. Светлой темы нет: приложение живёт в
+     фоне, тёмный фон экономит батарею и совпадает с иконкой. -->
 <resources>
     <!-- Поверхности -->
-    <color name="bg">#0B0F14</color>
-    <color name="surface">#11161C</color>
-    <color name="surface_1">#161C24</color>
-    <color name="surface_2">#1D2530</color>
-    <color name="outline">#33404F</color>
-    <color name="outline_soft">#212B36</color>
-    <color name="on_surface">#E7ECF2</color>
-    <color name="on_surface_muted">#9DAAB8</color>
+    <color name="bg">#070708</color>
+    <color name="surface">#0E0E10</color>
+    <color name="surface_1">#151518</color>
+    <color name="surface_2">#1E1E22</color>
+    <color name="outline">#5A2026</color>
+    <color name="outline_soft">#2A1316</color>
+    <color name="on_surface">#F4F4F6</color>
+    <color name="on_surface_muted">#A0A0AA</color>
+    <color name="icon_bg">#000000</color>
 
     <!-- Акценты -->
-    <color name="primary">#6C5CE7</color>
-    <color name="primary_container">#2B2450</color>
-    <color name="on_primary_container">#E4DEFF</color>
+    <color name="primary">#E11D2E</color>
+    <color name="primary_container">#3A0A10</color>
+    <color name="on_primary_container">#FFDADC</color>
     <color name="on_primary">#FFFFFF</color>
 
-    <color name="mint">#22C99B</color>
-    <color name="mint_dark">#063026</color>
+    <color name="mint">#3DDC97</color>
+    <color name="mint_dark">#06281B</color>
     <color name="amber">#FFB020</color>
-    <color name="red">#FF5B6B</color>
-    <color name="blue">#5AA9FF</color>
-    <color name="violet">#B07CFF</color>
+    <color name="red">#FF4D5E</color>
+    <color name="blue">#7FB2FF</color>
+    <color name="violet">#FF8A93</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 
     <!-- Логи -->
-    <color name="log_debug">#7A8798</color>
-    <color name="log_info">#DDE5EE</color>
+    <color name="log_debug">#83838D</color>
+    <color name="log_info">#E8E8EC</color>
     <color name="log_warn">#FFB020</color>
-    <color name="log_error">#FF5B6B</color>
-    <color name="log_send">#22C99B</color>
+    <color name="log_error">#FF6B76</color>
+    <color name="log_send">#3DDC97</color>
 </resources>

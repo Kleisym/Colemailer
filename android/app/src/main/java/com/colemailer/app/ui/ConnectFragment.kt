@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.view.View
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.colemailer.app.Prefs
@@ -75,10 +76,12 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
             }
             val ok = result?.optBoolean("ok") ?: false
             if (ok) {
-                setBusy(false, getString(R.string.toast_saved))
+                setBusy(false, "")
+                setStatus(getString(R.string.toast_saved), true)
             } else {
                 val error = result?.optString("error").orEmpty().ifBlank { "config.txt" }
-                setBusy(false, getString(R.string.toast_error_fmt, error))
+                setBusy(false, "")
+                setStatus(getString(R.string.toast_error_fmt, error), false)
             }
         }
     }
@@ -109,10 +112,10 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
                     Prefs.apiId = apiId.toString()
                     Prefs.apiHash = apiHash
                     Prefs.phone = returnedPhone
-                    tvStatus.text = getString(R.string.toast_auto_api_ok, apiId.toString())
+                    setStatus(getString(R.string.toast_auto_api_ok, apiId.toString()), true)
                 } else {
                     val error = json.optString("error").ifBlank { "my.telegram.org" }
-                    tvStatus.text = getString(R.string.toast_error_fmt, error)
+                    setStatus(getString(R.string.toast_error_fmt, error), false)
                 }
             }
         }
@@ -122,9 +125,21 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         btnAuto.isEnabled = !busy
         btnSave.isEnabled = !busy
         when {
-            message.isNotEmpty() -> tvStatus.text = message
-            busy -> tvStatus.text = "…"
+            message.isNotEmpty() -> setStatus(message, null)
+            busy -> setStatus("…", null)
         }
+    }
+
+    /** Зелёный — успех, красный — ошибка, серый — «в процессе»/подсказка. */
+    private fun setStatus(message: String, ok: Boolean?) {
+        if (!isAdded) return
+        tvStatus.text = message
+        val color = when (ok) {
+            true -> R.color.mint
+            false -> R.color.red
+            null -> R.color.on_surface_muted
+        }
+        tvStatus.setTextColor(ContextCompat.getColor(requireContext(), color))
     }
 
     private fun toast(message: String) {

@@ -12,6 +12,7 @@ import com.colemailer.app.BatteryOpt
 import com.colemailer.app.OemAutostart
 import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
+import com.colemailer.app.RootShell
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.google.android.material.textfield.TextInputEditText
@@ -49,8 +50,9 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
 
         view.findViewById<MaterialButton>(R.id.btn_save_settings).setOnClickListener { saveSettings() }
         view.findViewById<MaterialButton>(R.id.btn_fix_all).setOnClickListener {
-            (activity as? MainActivity)?.permissionFlow?.requestNext()
+            (activity as? MainActivity)?.permissionFlow?.requestAll()
         }
+        view.findViewById<MaterialButton>(R.id.btn_root_grants).setOnClickListener { grantViaRoot() }
         view.findViewById<MaterialButton>(R.id.btn_open_autostart).setOnClickListener {
             (activity as? MainActivity)?.permissionFlow?.openAutostart()
         }
@@ -132,6 +134,41 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
             append(OemAutostart.manualSteps())
         }
         tvBgReport.text = text.trim()
+    }
+
+    /**
+     * Root-режим: если su есть, выдаём разрешения и appops командами.
+     * Без root просто запускаем обычный мастер системных диалогов.
+     */
+    private fun grantViaRoot() {
+        val context = requireContext().applicationContext
+        val button = view?.findViewById<MaterialButton>(R.id.btn_root_grants) ?: return
+        button.isEnabled = false
+        Toast.makeText(requireContext(), R.string.toast_root_checking, Toast.LENGTH_SHORT).show()
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                if (!RootShell.isAvailable()) {
+                    null
+                } else {
+                    RootShell.grantAll(context)
+                }
+            }
+            button.isEnabled = true
+            if (result == null) {
+                Toast.makeText(requireContext(), R.string.toast_root_unavailable, Toast.LENGTH_LONG).show()
+                (activity as? MainActivity)?.permissionFlow?.requestAll()
+                return@launch
+            }
+            refreshBackgroundReport()
+            if (result.ok) {
+                Toast.makeText(requireContext(), R.string.toast_root_ok, Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(requireContext(), R.string.toast_root_failed, Toast.LENGTH_LONG).show()
+                tvBgReport.append("\n\nroot:\n")
+                tvBgReport.append(result.log.takeLast(1200))
+            }
+        }
     }
 
     private fun appVersion(): String {

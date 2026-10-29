@@ -7,8 +7,8 @@
         <item name="colorOnPrimary">@color/on_primary</item>
         <item name="colorPrimaryContainer">@color/primary_container</item>
         <item name="colorOnPrimaryContainer">@color/on_primary_container</item>
-        <item name="colorSecondary">@color/mint</item>
-        <item name="colorOnSecondary">@color/mint_dark</item>
+        <item name="colorSecondary">@color/violet</item>
+        <item name="colorOnSecondary">@color/black</item>
         <item name="colorSurface">@color/surface</item>
         <item name="colorOnSurface">@color/on_surface</item>
         <item name="colorSurfaceVariant">@color/surface_2</item>
@@ -18,8 +18,9 @@
         <item name="android:colorBackground">@color/bg</item>
         <item name="android:windowBackground">@color/bg</item>
         <item name="android:statusBarColor">@color/bg</item>
-        <item name="android:navigationBarColor">@color/surface</item>
+        <item name="android:navigationBarColor">@color/bg</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
         <item name="materialCardViewStyle">@style/Widget.Colemailer.Card</item>
         <item name="materialAlertDialogTheme">@style/Theme.Colemailer.Dialog</item>
         <item name="bottomNavigationStyle">@style/Widget.Colemailer.BottomNav</item>
@@ -72,6 +73,6 @@
         <item name="cornerRadius">16dp</item>
         <item name="android:minHeight">56dp</item>
         <item name="backgroundTint">@color/red</item>
-        <item name="android:textColor">@color/black</item>
+        <item name="android:textColor">@color/on_primary</item>
     </style>
 </resources>
