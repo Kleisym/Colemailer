@@ -2,11 +2,16 @@ package com.colemailer.app.ui
 
 import android.os.Bundle
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
+import com.colemailer.app.Account
+import com.colemailer.app.AccountStore
 import com.colemailer.app.Prefs
 import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
@@ -16,10 +21,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.UUID
 
 /**
  * Подключение: api_id/api_hash/телефон/2FA, ручное сохранение и авто-получение
  * ключей через my.telegram.org (код подтверждения приходит в Telegram).
+ *
+ * Аккаунтов может быть несколько: список сверху, переключение подставляет
+ * ключи выбранного, сессии лежат отдельными файлами.
  */
 class ConnectFragment : Fragment(R.layout.fragment_connect) {
 
@@ -30,6 +39,11 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
     private lateinit var tvStatus: TextView
     private lateinit var btnAuto: MaterialButton
     private lateinit var btnSave: MaterialButton
+    private lateinit var spinner: Spinner
+
+    private lateinit var accounts: MutableList<Account>
+    private var currentId: String = ""
+    private var filling = false
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -41,14 +55,142 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         tvStatus = view.findViewById(R.id.tv_connect_status)
         btnAuto = view.findViewById(R.id.btn_auto_api)
         btnSave = view.findViewById(R.id.btn_save_keys)
+        spinner = view.findViewById(R.id.spinner_accounts)
 
+        accounts = AccountStore.load(requireContext())
+        refreshSpinner()
+        val active = AccountStore.active(requireContext())
+        if (active != null) {
+            currentId = active.id
+            spinner.setSelection(accounts.indexOfFirst { it.id == active.id }.coerceAtLeast(0))
+            fill(active)
+        } else {
+            fillFromPrefs()
+        }
+
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (filling) return
+                val selected = accounts.getOrNull(position) ?: return
+                if (selected.id == currentId) return
+                saveCurrent()
+                currentId = selected.id
+                AccountStore.select(requireContext(), selected)
+                fill(selected)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
+        view.findViewById<MaterialButton>(R.id.btn_add_account).setOnClickListener { addAccount() }
+        view.findViewById<MaterialButton>(R.id.btn_delete_account).setOnClickListener { deleteAccount() }
+        btnSave.setOnClickListener { saveKeys() }
+        btnAuto.setOnClickListener { autoApi() }
+    }
+
+    override fun onPause() {
+        saveCurrent()
+        super.onPause()
+    }
+
+    private fun refreshSpinner() {
+        val adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            accounts.map { it.name }
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+    }
+
+    private fun fill(account: Account) {
+        filling = true
+        etApiId.setText(account.apiId)
+        etApiHash.setText(account.apiHash)
+        etPhone.setText(account.phone)
+        etPassword.setText(account.password)
+        filling = false
+        AccountStore.select(requireContext(), account)
+        tvStatus.text = getString(R.string.account_selected, account.name)
+        tvStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.on_surface_muted))
+    }
+
+    private fun fillFromPrefs() {
+        filling = true
         etApiId.setText(Prefs.apiId)
         etApiHash.setText(Prefs.apiHash)
         etPhone.setText(Prefs.phone)
         etPassword.setText(Prefs.password2fa)
+        filling = false
+    }
 
-        btnSave.setOnClickListener { saveKeys() }
-        btnAuto.setOnClickListener { autoApi() }
+    /** Сохранить поля формы в текущий (или новый) аккаунт. */
+    private fun saveCurrent() {
+        if (!isAdded) return
+        val apiId = etApiId.text?.toString()?.trim().orEmpty()
+        val apiHash = etApiHash.text?.toString()?.trim().orEmpty()
+        val phone = etPhone.text?.toString()?.trim().orEmpty()
+        val password = etPassword.text?.toString()?.trim().orEmpty()
+        val index = accounts.indexOfFirst { it.id == currentId }
+        if (index >= 0) {
+            accounts[index] = accounts[index].copy(
+                apiId = apiId, apiHash = apiHash, phone = phone, password = password
+            )
+        } else if (apiId.isNotBlank() || phone.isNotBlank()) {
+            val account = Account(
+                id = UUID.randomUUID().toString(),
+                name = getString(R.string.account_new_name, accounts.size + 1),
+                apiId = apiId, apiHash = apiHash, phone = phone, password = password
+            )
+            accounts.add(account)
+            currentId = account.id
+        } else {
+            return
+        }
+        AccountStore.save(requireContext(), accounts)
+        accounts.firstOrNull { it.id == currentId }?.let { AccountStore.select(requireContext(), it) }
+    }
+
+    private fun addAccount() {
+        saveCurrent()
+        val account = Account(
+            id = UUID.randomUUID().toString(),
+            name = getString(R.string.account_new_name, accounts.size + 1),
+            apiId = etApiId.text?.toString()?.trim().orEmpty(),
+            apiHash = etApiHash.text?.toString()?.trim().orEmpty(),
+            phone = etPhone.text?.toString()?.trim().orEmpty(),
+            password = etPassword.text?.toString()?.trim().orEmpty()
+        )
+        accounts.add(account)
+        currentId = account.id
+        AccountStore.save(requireContext(), accounts)
+        AccountStore.select(requireContext(), account)
+        refreshSpinner()
+        filling = true
+        spinner.setSelection(accounts.lastIndex)
+        filling = false
+        fill(account)
+        toast(getString(R.string.account_added))
+    }
+
+    private fun deleteAccount() {
+        if (accounts.size <= 1) {
+            toast(getString(R.string.account_last))
+            return
+        }
+        val index = accounts.indexOfFirst { it.id == currentId }
+        if (index >= 0) accounts.removeAt(index)
+        currentId = accounts.firstOrNull()?.id.orEmpty()
+        AccountStore.save(requireContext(), accounts)
+        refreshSpinner()
+        filling = true
+        spinner.setSelection(0)
+        filling = false
+        accounts.firstOrNull()?.let {
+            AccountStore.select(requireContext(), it)
+            fill(it)
+        } ?: fillFromPrefs()
+        toast(getString(R.string.account_deleted))
     }
 
     private fun saveKeys() {
@@ -73,6 +215,7 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         Prefs.apiHash = apiHash
         Prefs.phone = phone
         Prefs.password2fa = password
+        saveCurrent()
 
         val context = requireContext().applicationContext
         setBusy(true, "")
@@ -124,6 +267,7 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
                     Prefs.apiId = apiId.toString()
                     Prefs.apiHash = apiHash
                     Prefs.phone = returnedPhone
+                    saveCurrent()
                     setStatus(getString(R.string.toast_auto_api_ok, apiId.toString()), true)
                 } else {
                     val error = json.optString("error").ifBlank { "my.telegram.org" }

@@ -64,6 +64,11 @@ object Prefs {
         get() = sp.getLong("last_update_check", 0L)
         set(value) = sp.edit().putLong("last_update_check", value).apply()
 
+    /** id выбранного аккаунта из accounts.json. */
+    var activeAccountId: String
+        get() = sp.getString("active_account_id", "") ?: ""
+        set(value) = sp.edit().putString("active_account_id", value).apply()
+
     // --- секреты (Android Keystore) ---------------------------------------
     var apiId: String
         get() = SecretStore.get("api_id", "") ?: ""

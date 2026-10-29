@@ -26,6 +26,7 @@ object Notifications {
     const val ID_FOREGROUND = 1001
     const val ID_AUTH = 1002
     const val ID_UPDATE = 1003
+    const val ID_AUTH_WAIT = 1004
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -129,6 +130,28 @@ object Notifications {
 
     fun cancelAuth(context: Context) {
         runCatching { NotificationManagerCompat.from(context).cancel(ID_AUTH) }
+    }
+
+    /** Постоянное уведомление на время ожидания кода: процесс не умирает. */
+    fun authWait(context: Context): Notification {
+        val intent = Intent(context, AuthActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pending = PendingIntent.getActivity(
+            context,
+            20,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(context, CHANNEL_SERVICE)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(context.getString(R.string.auth_wait_title))
+            .setContentText(context.getString(R.string.auth_wait_text))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(pending)
+            .build()
     }
 
     private fun openApp(context: Context): PendingIntent {

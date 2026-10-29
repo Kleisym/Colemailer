@@ -47,6 +47,7 @@ object AuthQueue {
         val context = App.context
         StatusStore.setPhase(phaseOf(kind), title, running = true)
         Notifications.authRequest(context, kind, title, hint)
+        AuthWaitService.start(context)
         openAuthScreen(context, kind, title, hint)
 
         val received = try {
@@ -58,6 +59,7 @@ object AuthQueue {
 
         synchronized(lock) { queue.remove(request) }
         Notifications.cancelAuth(context)
+        AuthWaitService.stop(context)
 
         return if (received && request.answered) {
             request.value
@@ -90,7 +92,11 @@ object AuthQueue {
 
     /** Ответ из [com.colemailer.app.ui.AuthActivity]. true — запрос был. */
     fun submit(kind: Kind, value: String): Boolean {
-        val request = synchronized(lock) { queue.firstOrNull { it.kind == kind } } ?: return false
+        val request = synchronized(lock) {
+            val found = queue.firstOrNull { it.kind == kind } ?: return false
+            queue.remove(found)
+            found
+        }
         request.value = value.trim()
         request.answered = true
         request.latch.countDown()
@@ -98,7 +104,11 @@ object AuthQueue {
     }
 
     fun cancel(kind: Kind) {
-        val request = synchronized(lock) { queue.firstOrNull { it.kind == kind } } ?: return
+        val request = synchronized(lock) {
+            val found = queue.firstOrNull { it.kind == kind } ?: return
+            queue.remove(found)
+            found
+        }
         request.answered = false
         request.latch.countDown()
     }
@@ -117,12 +127,14 @@ object AuthQueue {
 
     fun pendingKind(): Kind? = synchronized(lock) { queue.firstOrNull()?.kind }
 
+    fun pendingRequest(): Request? = synchronized(lock) { queue.firstOrNull() }
+
     fun hasPending(): Boolean = pendingKind() != null
 
     private fun phaseOf(kind: Kind): Phase =
         if (kind == Kind.CODE) Phase.CODE_REQUIRED else Phase.PASSWORD_REQUIRED
 
-    // Ввод кода/пароля — это не «5 минут молчания»: дольше двух минут
-    // пользователь всё равно не вернётся, а бот простаивает.
-    private const val TIMEOUT_MS = 180_000L
+    // Человек уходит в Telegram за кодом, потом возвращается — 10 минут
+    // выглядят разумным пределом, трёх минут не хватало.
+    private const val TIMEOUT_MS = 600_000L
 }

@@ -31,8 +31,12 @@ class AuthActivity : AppCompatActivity() {
         const val MODE_PASSWORD = "password"
     }
 
+    private val pending get() = AuthQueue.pendingRequest()
+
     private val isCode: Boolean by lazy {
-        (intent?.getStringExtra(EXTRA_MODE) ?: MODE_CODE) == MODE_CODE
+        val mode = intent?.getStringExtra(EXTRA_MODE)
+            ?: if (pending?.kind == AuthQueue.Kind.CODE) MODE_CODE else MODE_PASSWORD
+        mode == MODE_CODE
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -61,13 +65,17 @@ class AuthActivity : AppCompatActivity() {
         val error = findViewById<TextView>(R.id.tv_auth_error)
 
         title.text = intent?.getStringExtra(EXTRA_TITLE)
+            ?: pending?.title
             ?: getString(if (isCode) R.string.auth_title_code else R.string.auth_title_password)
         description.text = intent?.getStringExtra(EXTRA_HINT)
+            ?: pending?.hint
             ?: getString(if (isCode) R.string.auth_hint_code else R.string.auth_hint_password)
         inputLayout.hint = getString(if (isCode) R.string.auth_hint_code else R.string.auth_hint_password)
 
+        // Код подтверждения может быть не только из цифр: не ограничиваем
+        // поле числовой клавиатурой и не фильтруем символы.
         input.inputType = if (isCode) {
-            InputType.TYPE_CLASS_NUMBER
+            InputType.TYPE_CLASS_TEXT
         } else {
             InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }

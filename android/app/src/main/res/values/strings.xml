@@ -13,6 +13,8 @@
     <string name="notif_code_text">Код пришёл в чат «Telegram». Нажмите, чтобы ввести.</string>
     <string name="notif_password_title">Нужен пароль 2FA</string>
     <string name="notif_password_text">Введите облачный пароль Telegram.</string>
+    <string name="auth_wait_title">Ждём код Telegram</string>
+    <string name="auth_wait_text">Можно уйти в Telegram за кодом — нажмите сюда, чтобы вернуться к вводу.</string>
 
     <!-- Навигация -->
     <string name="nav_home">Главная</string>
@@ -72,6 +74,15 @@
     <!-- Подключение -->
     <string name="connect_title">Подключение</string>
     <string name="connect_hint">Telegram выдаёт api_id и api_hash для приложения. Их можно получить автоматически: код подтверждения придёт в чат «Telegram».</string>
+    <string name="accounts_label">Аккаунт</string>
+    <string name="btn_add_account">Добавить</string>
+    <string name="btn_delete_account">Удалить</string>
+    <string name="account_new_name">Аккаунт %1$d</string>
+    <string name="account_added">Аккаунт добавлен</string>
+    <string name="account_deleted">Аккаунт удалён</string>
+    <string name="account_selected">Аккаунт: %1$s</string>
+    <string name="account_last">Нельзя удалить единственный аккаунт</string>
+    <string name="account_fill_first">Заполните api_id, api_hash и телефон</string>
     <string name="hint_api_id">api_id (только цифры)</string>
     <string name="hint_api_hash">api_hash (32 символа)</string>
     <string name="hint_phone">Телефон (+79991234567)</string>

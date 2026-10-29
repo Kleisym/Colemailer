@@ -1,5 +1,6 @@
 package com.colemailer.app.ui
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
@@ -11,6 +12,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
+import com.colemailer.app.AuthQueue
 import com.colemailer.app.Notifications
 import com.colemailer.app.PermissionFlow
 import com.colemailer.app.Prefs
@@ -145,6 +147,18 @@ class MainActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         val bottomNav = findViewById<BottomNavigationView>(R.id.bottom_nav)
         outState.putInt(KEY_TAB, bottomNav.selectedItemId)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Вернулись из Telegram, пока ждали код — сразу показываем ввод,
+        // а не заставляем искать уведомление.
+        if (AuthQueue.hasPending()) {
+            startActivity(
+                Intent(this, AuthActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            )
+        }
     }
 
     /** Переключить вкладку из кода (например, «нет ключей — идите в Подключение»). */
