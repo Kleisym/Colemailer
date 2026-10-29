@@ -121,6 +121,60 @@ class _FormParser(HTMLParser):
             self._current = None
 
 
+class _LinkParser(HTMLParser):
+    """Ссылки страницы /apps: список приложений кликабельный, а ключи лежат
+    уже на странице конкретного приложения."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: Optional[str] = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, " ".join(self._text).strip()))
+            self._href = None
+            self._text = []
+
+
+def _app_links(page: str) -> list[str]:
+    """Кандидаты на страницу приложения из списка /apps."""
+    parser = _LinkParser()
+    try:
+        parser.feed(page)
+    except Exception:
+        return []
+    result: list[str] = []
+    for href, text in parser.links:
+        low = href.lower()
+        if not href or any(bad in low for bad in ("logout", "delete", "/auth/", "send_password")):
+            continue
+        if "app_id=" in low or re.search(r"/apps/\d+", low):
+            result.append(href)
+        elif "active app" in text.lower() or "created" in text.lower():
+            result.append(href)
+    # Иногда ссылка собирается JS — ищем app_id в тексте страницы.
+    for match in re.findall(r'href=["\']([^"\']*app_id=[^"\']*)["\']', page, re.IGNORECASE):
+        result.append(html_module.unescape(match))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for href in result:
+        if href not in seen:
+            seen.add(href)
+            unique.append(href)
+    return unique
+
+
 def _create_form(page: str) -> Optional[dict]:
     parser = _FormParser()
     try:
@@ -393,11 +447,30 @@ class MyTelegramAuth:
         # fetch_app()/create_app().
         self.authorized = True
 
+    def _follow_app_links(self, page: str) -> Optional[Dict[str, object]]:
+        """Пройти по ссылкам списка приложений и разобрать карточку."""
+        for href in _app_links(page):
+            candidate = urllib.parse.urljoin(SITE, href)
+            if candidate.rstrip("/") == f"{SITE}/apps":
+                continue
+            try:
+                detail = self._open(candidate)
+            except Exception:
+                continue
+            found = parse_apps_page(detail)
+            if found:
+                self.save_cookies()
+                return found
+        return None
+
     def fetch_app(self) -> Optional[Dict[str, object]]:
         """Уже созданное приложение аккаунта, если оно есть."""
         page = self._open(f"{SITE}/apps")
         self.save_cookies()
-        return parse_apps_page(page)
+        found = parse_apps_page(page)
+        if found:
+            return found
+        return self._follow_app_links(page)
 
     def create_app(
         self,
@@ -410,6 +483,8 @@ class MyTelegramAuth:
         """Создать приложение и вернуть api_id/api_hash."""
         page = self._open(f"{SITE}/apps")
         existing = parse_apps_page(page)
+        if not existing:
+            existing = self._follow_app_links(page)
         if existing:
             return existing
         form = _create_form(page)

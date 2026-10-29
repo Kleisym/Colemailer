@@ -159,6 +159,25 @@ def test_create_app_uses_the_create_form_hash_not_a_delete_form():
     assert b"app_description=" in body
 
 
+def test_fetch_app_follows_the_active_app_link():
+    list_page = """
+    <h4>App configuration</h4>
+    <a href="/apps?app_id=1234567">Active App · created 22 Dec 2024</a>
+    """
+    opener = FakeOpener(
+        get_pages={
+            "/apps": list_page,
+            "/apps?app_id=1234567": APPS_PAGE,
+        }
+    )
+    auth = make_auth(opener)
+
+    found = auth.fetch_app()
+
+    assert found == {"api_id": 1234567, "api_hash": "0123456789abcdef0123456789abcdef"}
+    assert any("app_id=1234567" in call[1] for call in opener.calls)
+
+
 def test_parse_apps_page_returns_none_when_the_app_is_not_created_yet():
     assert parse_apps_page(CREATE_FORM_PAGE) is None
 
