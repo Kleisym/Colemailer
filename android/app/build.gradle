@@ -4,37 +4,87 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// ---------------------------------------------------------------------------
+// Стабильная подпись.
+// Ключ лежит в репозитории (android/app/colemailer.keystore), и им подписаны
+// И release, И debug. Иначе каждый раннер CI генерирует свой debug-ключ и
+// новый APK не ставится поверх предыдущего.
+// ---------------------------------------------------------------------------
+def keystoreFile = file("colemailer.keystore")
+def ksAlias = "colemailer"
+def ksPassword = "Colemailer2026"
+def hasKeystore = keystoreFile.exists()
+
+// Версия приложения берётся из cole/version.py (единый источник для Python,
+// APK и тега релиза). VERSION_CODE из CI = номер сборки, чтобы versionCode рос
+// без ручного бампа.
+def appVersion = "3.0.0"
+def versionFile = file("../../cole/version.py")
+if (versionFile.exists()) {
+    def match = versionFile.text =~ /VERSION\s*=\s*["']([^"']+)["']/
+    if (match.find()) {
+        appVersion = match.group(1)
+    }
+}
+def ciVersionCode = 0
+try {
+    ciVersionCode = (System.getenv("VERSION_CODE") ?: "0").toInteger()
+} catch (Exception ignored) {
+    ciVersionCode = 0
+}
+
 android {
-    namespace 'com.spambuster.app'
-    compileSdk 34
+    namespace 'com.colemailer.app'
+    compileSdk 35
 
     defaultConfig {
-        applicationId "com.spambuster.app"
+        applicationId "com.colemailer.app"
         minSdk 24
-        targetSdk 34
-        versionCode 4
-        versionName "2.2.0"
+        targetSdk 35
+        versionCode Math.max(ciVersionCode, 30)
+        versionName appVersion
 
         ndk {
-            // All four ABIs: old 32-bit phones (armeabi-v7a) were unable to install the APK
-            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64", "x86"
+            // x86 оставлен за бортом: Chaquopy на Python 3.12+ его не собирает,
+            // а APK с ним почти вдвое больше.
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
         }
 
-        python {
-            version "3.11"
-            pip {
-                install "telethon>=1.36.0,<2.0.0"
+        // src/main/python — source root Chaquopy. В репозитории там только
+        // bot_bridge.py; bot.py и пакет cole/ копирует CI перед сборкой
+        // (см. .github/workflows/build-apk.yml).
+    }
+
+    signingConfigs {
+        if (hasKeystore) {
+            stable {
+                storeFile keystoreFile
+                storePassword ksPassword
+                keyAlias ksAlias
+                keyPassword ksPassword
+                v1SigningEnabled true
+                v2SigningEnabled true
             }
         }
     }
 
     buildTypes {
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }
         debug {
             debuggable true
+            if (hasKeystore) {
+                signingConfig signingConfigs.stable
+            }
+        }
+        release {
+            // minify выключен осознанно: Chaquopy дергает Kotlin-колбэк
+            // рефлексией, а Telethon грузится из Python — экономия размера
+            // не стоит риска «в релизе работает иначе, чем в debug».
+            minifyEnabled false
+            shrinkResources false
+            if (hasKeystore) {
+                signingConfig signingConfigs.stable
+            }
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 
@@ -47,16 +97,48 @@ android {
         jvmTarget = '17'
     }
 
-    buildFeatures {
-        viewBinding true
+    packaging {
+        resources {
+            excludes += [
+                    "META-INF/*.kotlin_module",
+                    "META-INF/DEPENDENCIES",
+                    "META-INF/LICENSE*",
+                    "META-INF/NOTICE*",
+                    "META-INF/AL2.0",
+                    "META-INF/LGPL2.1",
+            ]
+        }
+    }
+
+    lint {
+        abortOnError false
     }
 }
 
-
 dependencies {
-    implementation 'androidx.core:core-ktx:1.12.0'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
-    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'androidx.activity:activity-ktx:1.9.3'
+    implementation 'androidx.fragment:fragment-ktx:1.8.5'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.work:work-runtime-ktx:2.9.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+}
+
+// Настройки Chaquopy: python-код лежит в src/main/python (стандартный sourceSet),
+// abiFilters задан в android.defaultConfig.ndk.
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+        pip {
+            // Держать в синхроне с requirements.txt в корне репозитория.
+            install("telethon>=1.45.0,<2.0.0")
+            // Страховка, если cacert.pem не доедет до APK: api_autoreg.py
+            // берёт CA-бандл из пакета, а при его отсутствии — из certifi.
+            install("certifi")
+        }
+    }
 }

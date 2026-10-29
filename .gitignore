@@ -43,6 +43,11 @@ android/local.properties
 .idea/
 *.iml
 
+# Python sources are copied into the APK by CI, the bridge lives here
+android/app/src/main/python/bot.py
+android/app/src/main/python/cole/
+android/app/src/main/python/storage/
+
 # Bench scratch: verification artefacts, baseline snapshots, helper scripts.
 # These hold duplicate copies of the source tree and are not part of the app.
 .bench/

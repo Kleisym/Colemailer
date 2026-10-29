@@ -1,19 +1,34 @@
 @echo off
 chcp 65001 >nul
+setlocal
+title Colemailer - удаление автозапуска
+
+set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+set "TARGET_VBS=%STARTUP%\ColemailerAutostart.vbs"
+set "LEGACY_VBS=%STARTUP%\TelegramSpambusterAutostart.vbs"
+
 echo ======================================================
-echo  Удаление автозапуска Telegram Spambuster (Windows)
+echo  Colemailer - удаление автозапуска Windows
 echo ======================================================
 echo.
 
-set "STARTUP_FOLDER=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-set "TARGET_VBS=%STARTUP_FOLDER%\TelegramSpambusterAutostart.vbs"
-
+set "FOUND=0"
 if exist "%TARGET_VBS%" (
     del /f /q "%TARGET_VBS%"
-    echo ✅ Автозапуск успешно удален из папки Автозагрузки.
-) else (
-    echo [i] Файл автозапуска не найден в Автозагрузке.
+    echo [OK] Удалён: %TARGET_VBS%
+    set "FOUND=1"
+)
+if exist "%LEGACY_VBS%" (
+    del /f /q "%LEGACY_VBS%"
+    echo [OK] Удалён старый: %LEGACY_VBS%
+    set "FOUND=1"
+)
+if "%FOUND%"=="0" (
+    echo [i] Автозапуска в папке Автозагрузки нет - удалять нечего.
 )
 
+echo.
+echo Сам бот, если он уже запущен, продолжает работать.
+echo Остановить его: scripts\stop_windows.bat
 echo.
 pause

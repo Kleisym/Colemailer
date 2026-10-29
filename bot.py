@@ -34,19 +34,16 @@ from telethon.tl.types import (
 )
 
 try:
-    from telethon._updates.messagebox import MessageBox
-
-    def _patched_get_channel_difference(self, chat_hashes):
-        entry = next((id for id in list(self.getting_diff_for) if isinstance(id, int)), None)
-        if entry is not None:
-            self.end_get_diff(entry)
-            self.map.pop(entry, None)
-            self.possible_gaps.pop(entry, None)
-        return None
-
-    MessageBox.get_channel_difference = _patched_get_channel_difference
+    from telethon._updates.messagebox import MessageBox  # noqa: F401  (проверка совместимости)
 except Exception:
-    pass
+    MessageBox = None  # type: ignore
+
+try:
+    from cole.version import VERSION as APP_VERSION
+except Exception:
+    APP_VERSION = "3.0.0"
+
+APP_NAME = "Colemailer"
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
@@ -79,8 +76,8 @@ DEFAULT_CONFIG = """# ==========================================================
 # 3. В Telegram придет код от официального сервиса — вставь его на сайте и нажми Sign In.
 # 4. Выбери пункт "API development tools".
 # 5. В форме заполни два поля (любыми латинскими буквами):
-#    - App title: например, Spambuster
-#    - Short name: например, spambuster
+#    - App title: например, Colemailer
+#    - Short name: например, colemailer
 #    Остальные поля оставь пустыми.
 # 6. Нажми "Create application" (или Save changes).
 # 7. Скопируй полученные данные:
@@ -245,6 +242,58 @@ def log_info(msg: str):
 def log_error(msg: str):
     print(msg)
 
+# ---------------------------------------------------------------------------
+# Кнопки постов. Разбор и сборка живут в cole/buttons.py, здесь только
+# тонкие обёртки: так бот остаётся рабочим, даже если пакет не скопировали.
+# ---------------------------------------------------------------------------
+def _row_get(row: Any, key: str, default: Any = ""):
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def buttons_from_json(raw: Optional[str]) -> List[Any]:
+    try:
+        from cole.buttons import from_json
+    except Exception:
+        return []
+    return from_json(raw)
+
+
+def buttons_to_json(rows: Optional[Any]) -> str:
+    try:
+        from cole.buttons import to_json
+    except Exception:
+        return ""
+    return to_json(rows)
+
+
+def build_buttons_markup(rows: Optional[Any]):
+    try:
+        from cole.buttons import build_markup
+        return build_markup(rows)
+    except Exception as e:
+        log_error(f"[BTN] Кнопки не собраны ({type(e).__name__}: {e}) — пост уйдёт без них.")
+        return None
+
+
+def extract_buttons_block(payload: str) -> Tuple[str, List[Any]]:
+    try:
+        from cole.buttons import ButtonError, extract_buttons
+    except Exception:
+        return payload, []
+    return extract_buttons(payload)
+
+
+def describe_buttons(rows: Optional[Any]) -> str:
+    try:
+        from cole.buttons import describe
+    except Exception:
+        return "нет"
+    return describe(rows)
+
+
 _BOT_SYSTEM_MSG_IDS: Set[int] = set()
 
 def is_internal_bot_message(text: str) -> bool:
@@ -270,6 +319,12 @@ def is_internal_bot_message(text: str) -> bool:
     if t.startswith("❌ Настройка рассылки") and "отменена" in t:
         return True
     if t.startswith("✅ Рассылка") and ("запущена" in t or "остановлена" in t):
+        return True
+    if t.startswith(("🔘 Пришли раскладку", "✅ Кнопки", "🧹 Кнопки", "⚠️ Кнопки", "⚠️ Не вижу ни одной кнопки")):
+        return True
+    if "Превью ссылок" in t and t.startswith(("🚫", "🖼")):
+        return True
+    if t.startswith("🔇 ") and ("Заглушен" in t or "Обновлён мьют" in t):
         return True
     return False
 
@@ -314,6 +369,12 @@ class Database:
                 cols = [r["name"] for r in cursor.fetchall()]
                 if "bundle_json" not in cols:
                     cursor.execute("ALTER TABLE templates ADD COLUMN bundle_json TEXT DEFAULT ''")
+                if "buttons_json" not in cols:
+                    cursor.execute("ALTER TABLE templates ADD COLUMN buttons_json TEXT DEFAULT ''")
+                if "disable_preview" not in cols:
+                    cursor.execute("ALTER TABLE templates ADD COLUMN disable_preview INTEGER DEFAULT 0")
+                if "source_chat_id" not in cols:
+                    cursor.execute("ALTER TABLE templates ADD COLUMN source_chat_id INTEGER DEFAULT 0")
             except Exception:
                 pass
 
@@ -376,10 +437,18 @@ class Database:
                     username TEXT,
                     display_name TEXT,
                     scope TEXT DEFAULT 'user',
+                    action TEXT DEFAULT 'silent',
                     reason TEXT DEFAULT '',
                     created_at REAL
                 )
             """)
+            try:
+                cursor.execute("PRAGMA table_info(muted_peers)")
+                cols = [r["name"] for r in cursor.fetchall()]
+                if "action" not in cols:
+                    cursor.execute("ALTER TABLE muted_peers ADD COLUMN action TEXT DEFAULT 'silent'")
+            except Exception:
+                pass
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_muted_peers_lookup ON muted_peers (account_id, peer_key);")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_muted_peers_unique ON muted_peers (account_id, peer_key);")
 
@@ -399,6 +468,16 @@ class Database:
                 # folder broadcast. The folder sync must not resurrect it.
                 if "manual_stop" not in cols:
                     cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN manual_stop INTEGER DEFAULT 0")
+                # hybrid: момент, когда счётчик добрал порог. Отправка не должна
+                # догонять задачу через часы после того, как чат замолчал.
+                if "counter_ready_at" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN counter_ready_at REAL DEFAULT 0")
+                if "last_attempt_at" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN last_attempt_at REAL DEFAULT 0")
+                if "send_pending" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN send_pending INTEGER DEFAULT 0")
+                if "last_count_at" not in cols:
+                    cursor.execute("ALTER TABLE broadcast_tasks ADD COLUMN last_count_at REAL DEFAULT 0")
             except Exception:
                 pass
 
@@ -460,15 +539,22 @@ class Database:
         text: str,
         entities_hex: List[str],
         media_files: List[str],
-        bundle_json: str = ""
+        bundle_json: str = "",
+        buttons_json: str = "",
+        disable_preview: int = 0,
+        source_chat_id: int = 0,
     ):
         clean_name = name.strip("<>").strip()
         with self._conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO templates (name, text, entities_hex, media_files, bundle_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (clean_name, text, json.dumps(entities_hex), json.dumps(media_files), bundle_json, time.time()))
+                INSERT OR REPLACE INTO templates
+                    (name, text, entities_hex, media_files, bundle_json,
+                     buttons_json, disable_preview, source_chat_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (clean_name, text, json.dumps(entities_hex), json.dumps(media_files),
+                  bundle_json, buttons_json or "", int(disable_preview or 0),
+                  int(source_chat_id or 0), time.time()))
 
     def get_template(self, name: str) -> Optional[Dict[str, Any]]:
         clean_name = name.strip("<>").strip()
@@ -496,6 +582,9 @@ class Database:
                 "entities_hex": json.loads(row["entities_hex"]) if row["entities_hex"] else [],
                 "media_files": json.loads(row["media_files"]) if row["media_files"] else [],
                 "bundle": bundle,
+                "buttons": buttons_from_json(_row_get(row, "buttons_json", "")),
+                "disable_preview": int(_row_get(row, "disable_preview", 0) or 0),
+                "source_chat_id": int(_row_get(row, "source_chat_id", 0) or 0),
                 "created_at": row["created_at"]
             }
 
@@ -545,6 +634,8 @@ class Database:
                     "entities_hex": json.loads(r["entities_hex"]) if r["entities_hex"] else [],
                     "media_files": json.loads(r["media_files"]) if r["media_files"] else [],
                     "bundle": bundle,
+                    "buttons": buttons_from_json(_row_get(r, "buttons_json", "")),
+                    "disable_preview": int(_row_get(r, "disable_preview", 0) or 0),
                     "created_at": r["created_at"]
                 })
             return results
@@ -802,6 +893,12 @@ class Database:
             return [dict(r) for r in cursor.fetchall()]
 
     def increment_and_check_counter(self, chat_id: int, account_id: int = 0) -> List[Dict[str, Any]]:
+        """Посчитать живое сообщение чата и, если условия сошлись, отдать задачу.
+
+        hybrid: порог сообщений и пауза проверяются вместе. Момент, когда
+        счётчик добрал порог, запоминается в counter_ready_at — по нему потом
+        видно, что окно протухло и догоняющей отправки быть не должно.
+        """
         ready_tasks = []
         now = time.time()
         with self._conn() as conn:
@@ -820,96 +917,121 @@ class Database:
             tasks = cursor.fetchall()
             for row in tasks:
                 t = dict(row)
-                new_count = t["current_count"] + 1
                 mode = t.get("mode", "counter")
-                threshold = t["counter_threshold"]
+                threshold = max(int(t["counter_threshold"] or 0), 1)
+                interval = int(t.get("interval_seconds") or 0)
+                ready_at = float(t.get("counter_ready_at") or 0.0)
+
+                # Протухшее окно: сообщения были давно, значит это не «15 сообщений
+                # перед постом», а случайный хвост. Счёт начинается заново.
+                stale_after = max(interval * 3, 1800) if mode == "hybrid" else 0
+                if stale_after and ready_at and (now - ready_at) > stale_after:
+                    ready_at = 0.0
+                    t["current_count"] = 0
+                last_count_at = float(t.get("last_count_at") or 0.0)
+                if stale_after and not ready_at and int(t.get("current_count") or 0) > 0 \
+                        and last_count_at and (now - last_count_at) > stale_after:
+                    # Счётчик не добрал порог и замер: старые сообщения не в счёт.
+                    t["current_count"] = 0
+
+                new_count = int(t.get("current_count") or 0) + 1
+                time_ready = mode != "hybrid" or (now - float(t.get("last_sent_at") or 0.0)) >= interval
+                if mode == "hybrid" and new_count >= threshold and ready_at <= 0:
+                    ready_at = now
                 log_info(f"[COUNT] Чат {chat_id}: сообщение #{new_count}/{threshold} для рассылки '{t['template_name']}' ({mode})")
 
-                if mode == "hybrid":
-                    interval = t.get("interval_seconds", 0)
-                    last_sent = t.get("last_sent_at", 0.0) or 0.0
-                    time_ready = (now - last_sent) >= interval
-                    if new_count >= threshold and time_ready:
-                        ready_tasks.append(t)
-                        cursor.execute("""
-                            UPDATE broadcast_tasks 
-                            SET current_count = 0, last_sent_at = ? 
-                            WHERE id = ?
-                        """, (now, t["id"]))
-                    else:
-                        cursor.execute("""
-                            UPDATE broadcast_tasks 
-                            SET current_count = ? 
-                            WHERE id = ?
-                        """, (new_count, t["id"]))
-                else:
-                    if (t.get("retry_at") or 0) > 0:
-                        # A failed post is already waiting for its timed retry.
-                        cursor.execute("UPDATE broadcast_tasks SET current_count = ? WHERE id = ?", (new_count, t["id"]))
-                        continue
-                    if new_count >= threshold:
-                        ready_tasks.append(t)
-                        cursor.execute("""
-                            UPDATE broadcast_tasks 
-                            SET current_count = 0, last_sent_at = ? 
-                            WHERE id = ?
-                        """, (now, t["id"]))
-                    else:
-                        cursor.execute("""
-                            UPDATE broadcast_tasks 
-                            SET current_count = ? 
-                            WHERE id = ?
-                        """, (new_count, t["id"]))
+                # Счётчик не обнуляем здесь: состояние сбрасывается только
+                # после реальной отправки (mark_task_sent). Иначе падение
+                # процесса между claim и send теряет пост навсегда.
+                if (new_count >= threshold and time_ready
+                        and not (t.get("retry_at") or 0) > 0
+                        and not int(t.get("send_pending") or 0)):
+                    ready_tasks.append(t)
+                cursor.execute("""
+                    UPDATE broadcast_tasks
+                    SET current_count = ?, counter_ready_at = ?, last_count_at = ?
+                    WHERE id = ?
+                """, (new_count, ready_at, now, t["id"]))
         return ready_tasks
 
     # ---- atomic claims: only one caller can win a due task -----------------
-    def claim_interval_task(self, task_id: int, now: float) -> bool:
+    def claim_counter_task(self, task_id: int, now: float) -> bool:
         with self._conn() as conn:
             cur = conn.execute(
-                "UPDATE broadcast_tasks SET last_sent_at = ? "
-                "WHERE id = ? AND is_active = 1 AND (? - COALESCE(last_sent_at, 0)) >= interval_seconds",
-                (now, task_id, now),
+                "UPDATE broadcast_tasks SET send_pending = 1, last_attempt_at = ? "
+                "WHERE id = ? AND is_active = 1 AND COALESCE(send_pending, 0) = 0 "
+                "AND current_count >= counter_threshold",
+                (now, task_id),
             )
             return cur.rowcount == 1
 
-    def claim_hybrid_task(self, task_id: int, now: float) -> bool:
+    def claim_interval_task(self, task_id: int, now: float) -> bool:
         with self._conn() as conn:
             cur = conn.execute(
-                "UPDATE broadcast_tasks SET last_sent_at = ?, current_count = 0 "
-                "WHERE id = ? AND is_active = 1 AND current_count >= counter_threshold "
+                "UPDATE broadcast_tasks SET last_sent_at = ?, last_attempt_at = ?, send_pending = 1 "
+                "WHERE id = ? AND is_active = 1 AND COALESCE(send_pending, 0) = 0 "
                 "AND (? - COALESCE(last_sent_at, 0)) >= interval_seconds",
-                (now, task_id, now),
+                (now, now, task_id, now),
             )
             return cur.rowcount == 1
+
+    def claim_hybrid_task(self, task_id: int, now: float, stale_after: float = 0.0) -> bool:
+        """Забрать hybrid-задачу, если прошла пауза и порог ещё не протух."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM broadcast_tasks WHERE id = ? AND is_active = 1", (task_id,)
+            ).fetchone()
+            if not row:
+                return False
+            t = dict(row)
+            ready_at = float(t.get("counter_ready_at") or 0.0)
+            if stale_after and ready_at and (now - ready_at) > stale_after:
+                conn.execute(
+                    "UPDATE broadcast_tasks SET current_count = 0, counter_ready_at = 0, send_pending = 0 "
+                    "WHERE id = ?", (task_id,),
+                )
+                log_info(f"[HYBRID] Чат {t['chat_id']}: окно счётчика протухло, ждём новые сообщения.")
+                return False
+            if int(t.get("send_pending") or 0):
+                return False
+            if int(t.get("current_count") or 0) < max(int(t.get("counter_threshold") or 0), 1):
+                return False
+            if (now - float(t.get("last_sent_at") or 0.0)) < int(t.get("interval_seconds") or 0):
+                return False
+            conn.execute(
+                "UPDATE broadcast_tasks SET last_sent_at = ?, last_attempt_at = ?, send_pending = 1 WHERE id = ?",
+                (now, now, task_id),
+            )
+            return True
 
     def schedule_retry(self, task: Dict[str, Any], delay: float, failed: bool = True):
         """
         Make a claimed-but-unsent task due again after `delay` seconds.
 
-        interval/hybrid: shift last_sent_at so the timer fires after `delay`.
-        counter: set retry_at; the scheduler loop re-sends it then. The old
-        code forced current_count to the threshold, so the post went out on
-        the next message regardless of the configured count / slow mode.
+        interval/hybrid: сдвигаем last_sent_at так, чтобы таймер сработал через
+        delay. hybrid получает свежее окно счётчика: это уже принятое решение
+        отправить, ждать новых сообщений не нужно.
+        counter: ставим retry_at; счётчик не подделываем.
         """
         mode = task.get("mode") or "interval"
         interval = task.get("interval_seconds") or 0
-        threshold = task.get("counter_threshold") or 0
+        threshold = max(int(task.get("counter_threshold") or 0), 1)
         delay = max(float(delay), 1.0)
         now = time.time()
         with self._conn() as conn:
             if mode in ("interval", "hybrid"):
                 conn.execute(
-                    "UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?",
+                    "UPDATE broadcast_tasks SET last_sent_at = ?, send_pending = 0 WHERE id = ?",
                     (now - interval + delay, task["id"]),
                 )
             if mode == "hybrid":
                 conn.execute(
-                    "UPDATE broadcast_tasks SET current_count = MAX(current_count, ?) WHERE id = ?",
-                    (threshold, task["id"]),
+                    "UPDATE broadcast_tasks SET current_count = MAX(current_count, ?), counter_ready_at = ? WHERE id = ?",
+                    (threshold, now + delay, task["id"]),
                 )
             if mode == "counter":
                 conn.execute(
-                    "UPDATE broadcast_tasks SET retry_at = ? WHERE id = ?",
+                    "UPDATE broadcast_tasks SET retry_at = ?, send_pending = 0 WHERE id = ?",
                     (now + delay, task["id"]),
                 )
             if failed:
@@ -925,7 +1047,55 @@ class Database:
 
     def mark_task_sent(self, task_id: int):
         with self._conn() as conn:
-            conn.execute("UPDATE broadcast_tasks SET fail_count = 0, retry_at = 0 WHERE id = ?", (task_id,))
+            conn.execute(
+                "UPDATE broadcast_tasks SET fail_count = 0, retry_at = 0, send_pending = 0, "
+                "current_count = 0, counter_ready_at = 0, last_count_at = 0, last_sent_at = ? WHERE id = ?",
+                (time.time(), task_id),
+            )
+
+    def clear_pending(self, task_id: int):
+        with self._conn() as conn:
+            conn.execute("UPDATE broadcast_tasks SET send_pending = 0 WHERE id = ?", (task_id,))
+
+    def reset_pending_sends(self, account_id: int = 0):
+        """Подготовить задачи после старта процесса.
+
+        - снять send_pending, зависший после падения;
+        - сбросить накопленные счётчики: после рестарта порог считается заново,
+          иначе «хвост» из прошлой сессии добивает 15 сообщений одним новым;
+        - защита от скачка часов назад и от залпа по всем чатам после долгого
+          простоя: слишком просроченная задача получает новый интервал.
+        """
+        scope = " AND (account_id = ? OR account_id = 0)" if account_id else ""
+        params: List[Any] = [account_id] if account_id else []
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(f"UPDATE broadcast_tasks SET send_pending = 0 WHERE send_pending = 1{scope}", params)
+            conn.execute(
+                f"UPDATE broadcast_tasks SET current_count = 0, counter_ready_at = 0, last_count_at = 0, retry_at = 0 "
+                f"WHERE mode IN ('counter', 'hybrid'){scope}", params
+            )
+            conn.execute(
+                f"UPDATE broadcast_tasks SET last_sent_at = ? WHERE last_sent_at > ?{scope}",
+                [now, now + 300] + params,
+            )
+            conn.execute(
+                f"UPDATE broadcast_tasks SET last_sent_at = ? "
+                f"WHERE is_active = 1 AND interval_seconds > 0 AND last_sent_at > 0 "
+                f"AND (? - last_sent_at) > MAX(interval_seconds * 3, 3600){scope}",
+                [now - 1, now] + params,
+            )
+
+    def rearm_task(self, task_id: int):
+        """Начать интервал заново (после ручного запуска или простоя)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT interval_seconds FROM broadcast_tasks WHERE id = ?", (task_id,)).fetchone()
+            interval = int(row["interval_seconds"] or 0) if row else 0
+            conn.execute(
+                "UPDATE broadcast_tasks SET last_sent_at = ?, current_count = 0, counter_ready_at = 0, "
+                "retry_at = 0, send_pending = 0 WHERE id = ?",
+                (time.time() - interval, task_id),
+            )
 
     def get_due_retries(self, account_id: int = 0, now: Optional[float] = None) -> List[Dict[str, Any]]:
         now = time.time() if now is None else now
@@ -978,7 +1148,11 @@ class Database:
     def reset_hybrid_task(self, task_id: int):
         with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE broadcast_tasks SET current_count = 0, last_sent_at = ? WHERE id = ?", (time.time(), task_id))
+            cursor.execute(
+                "UPDATE broadcast_tasks SET current_count = 0, counter_ready_at = 0, last_count_at = 0, "
+                "last_sent_at = ?, send_pending = 0 WHERE id = ?",
+                (time.time(), task_id),
+            )
 
     def update_task_last_sent(self, task_id: int):
         with self._conn() as conn:
@@ -1462,28 +1636,33 @@ class Database:
         username: str = "",
         display_name: str = "",
         scope: str = "user",
-        reason: str = ""
+        reason: str = "",
+        action: str = "silent",
     ) -> bool:
         """Add a peer to the mute list. Returns True when newly added."""
         if peer_key is None:
             peer_key = peer_id
         clean_username = (username or "").lstrip("@").strip().lower()
         clean_name = (display_name or "").strip()
+        clean_action = (action or "silent").strip().lower()
+        if clean_action not in MUTE_ACTIONS:
+            clean_action = "silent"
         with self._conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO muted_peers
-                    (account_id, peer_id, peer_key, username, display_name, scope, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (account_id, peer_id, peer_key, username, display_name, scope, action, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (account_id, peer_id, peer_key, clean_username, clean_name, scope, reason, time.time())
+                (account_id, peer_id, peer_key, clean_username, clean_name, scope, clean_action, reason, time.time())
             )
             if cursor.rowcount == 0:
                 cursor.execute(
                     "UPDATE muted_peers SET username = COALESCE(NULLIF(?, ''), username), "
-                    "display_name = COALESCE(NULLIF(?, ''), display_name), scope = ? WHERE account_id = ? AND peer_key = ?",
-                    (clean_username, clean_name, scope, account_id, peer_key)
+                    "display_name = COALESCE(NULLIF(?, ''), display_name), scope = ?, action = ? "
+                    "WHERE account_id = ? AND peer_key = ?",
+                    (clean_username, clean_name, scope, clean_action, account_id, peer_key)
                 )
                 return False
             return True
@@ -1538,8 +1717,23 @@ ACTIVE_COLLECTORS: Dict[Any, Dict[str, Any]] = {}
 
 # Per-process index of muted peers so the hot incoming-message path never
 # touches sqlite. Rebuilt from the database on demand and after every change.
+# Что делать с сообщением заглушённого человека:
+#   silent — пометить прочитанным, чтобы снять пинг и уведомление;
+#   delete — прочитать и удалить сообщение;
+#   warn   — ответить предупреждением (не чаще раза в 10 минут на человека);
+#   ban    — снять право писать в чате (нужны права администратора).
+MUTE_ACTIONS = ("silent", "delete", "warn", "ban")
+MUTE_ACTION_ALIASES = {
+    "тихо": "silent", "silence": "silent", "silent": "silent", "read": "silent",
+    "удалить": "delete", "удаляй": "delete", "delete": "delete", "del": "delete",
+    "варн": "warn", "предупредить": "warn", "warn": "warn",
+    "бан": "ban", "ban": "ban", "кик": "ban", "kick": "ban",
+}
+
 _MUTE_CACHE: Dict[int, Set[int]] = {}
 _MUTE_CHAT_CACHE: Dict[int, Set[int]] = {}
+_MUTE_ACTION_CACHE: Dict[int, Dict[int, str]] = {}
+_MUTE_ACTION_CHAT_CACHE: Dict[int, Dict[int, str]] = {}
 
 def _strip_peer_id(value: int) -> int:
     """Telegram user ids arrive as 1000000000000+id; store and match the plain id."""
@@ -1559,40 +1753,73 @@ def mute_cache_rebuild(account_id: int = 0):
         with db._conn() as conn:
             if account_id:
                 rows = conn.execute(
-                    "SELECT peer_key, scope FROM muted_peers WHERE account_id = ? OR account_id = 0",
+                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action "
+                    "FROM muted_peers WHERE account_id = ? OR account_id = 0",
                     (account_id,)
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT peer_key, scope FROM muted_peers").fetchall()
+                rows = conn.execute(
+                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action FROM muted_peers"
+                ).fetchall()
     except Exception:
         return
 
     users = _MUTE_CACHE.setdefault(account_id, set())
     chats = _MUTE_CHAT_CACHE.setdefault(account_id, set())
+    user_actions = _MUTE_ACTION_CACHE.setdefault(account_id, {})
+    chat_actions = _MUTE_ACTION_CHAT_CACHE.setdefault(account_id, {})
     users.clear()
     chats.clear()
+    user_actions.clear()
+    chat_actions.clear()
     for r in rows:
         try:
             key = int(r["peer_key"])
         except Exception:
             continue
+        action = (r["action"] or "silent").strip().lower()
+        if action not in MUTE_ACTIONS:
+            action = "silent"
         if (r["scope"] or "user") == "chat":
             chats.add(key)
+            chat_actions[key] = action
         else:
             users.add(key)
+            user_actions[key] = action
 
 def is_peer_muted(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> bool:
     """True when the sender (or the chat itself) is muted for this account."""
-    if peer_id is None:
-        return False
+    return mute_action_for(account_id, peer_id, chat_id) is not None
+
+def mute_action_for(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> Optional[str]:
+    """Действие мьюта для отправителя или чата. None — не заглушён."""
+    if peer_id is None and chat_id is None:
+        return None
     try:
-        if _strip_peer_id(peer_id) in _MUTE_CACHE.get(account_id, set()):
-            return True
-        if chat_id is not None and int(chat_id) in _MUTE_CHAT_CACHE.get(account_id, set()):
-            return True
+        if peer_id is not None:
+            key = _strip_peer_id(peer_id)
+            action = _MUTE_ACTION_CACHE.get(account_id, {}).get(key)
+            if action:
+                return action
+        if chat_id is not None:
+            action = _MUTE_ACTION_CHAT_CACHE.get(account_id, {}).get(int(chat_id))
+            if action:
+                return action
     except Exception:
-        return False
-    return False
+        return None
+    return None
+
+
+def mute_scope_for(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> Optional[str]:
+    """'user' или 'chat' — в каком объёме сработал мьют."""
+    try:
+        if peer_id is not None and _strip_peer_id(peer_id) in _MUTE_CACHE.get(account_id, set()):
+            return "user"
+        if chat_id is not None and int(chat_id) in _MUTE_CHAT_CACHE.get(account_id, set()):
+            return "chat"
+    except Exception:
+        pass
+    return None
 
 # =============================================================================
 # SPAM / ADVERTISING DETECTION
@@ -1777,7 +2004,7 @@ _CONVO_RE = re.compile(
 )
 
 BUYER_QUESTION_TRIGGERS = [
-    r"\bпочем\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
+    r"\bпочем\b", r"\bцена\b", r"\bцену\b", r"\bактуально\b",
     r"\bсвободн\w*\b", r"\bстат[уа]\b", r"\bстатистик[ау]\b", r"\bохват\w*\b",
     r"\bчекни\s+лс\b", r"\bответь(?:те)?\s+в\s+лс\b", r"\bкуплю\s+рекламу\b", r"\bхочу\s+купить\b",
     r"\bпродашь\b", r"\bпродаешь\b", r"\bпродаете\b", r"\bсколько\s+стоит\b",
@@ -2060,9 +2287,14 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
         cap = 40
     score = max(0, score - min(damp, cap))
 
-    if not metadata and not catalogue_offer and is_genuine_buyer_question(text):
-        score = 0
-        factors.append("genuine_buyer_question(veto)")
+    if not metadata and not catalogue_offer:
+        strong_commercial = bool(
+            has_seller_ask or has_text_routing or has_emoji_routing or links
+            or (foreign_handles and (topic_points or has_sale_verb or has_dm_cta))
+        )
+        if not strong_commercial and is_genuine_buyer_question(text):
+            score = 0
+            factors.append("genuine_buyer_question(veto)")
 
     return score, (factors[0] if factors else "low_score"), factors
 
@@ -2170,12 +2402,17 @@ def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = N
         score, _t, _f = calculate_spam_score(text, message, ping_kind=ping_kind)
         if score >= SPAM_THRESHOLD - 15:
             return True
-    if ping_kind in ("username", "name") and _is_visual_media(message):
+    if ping_kind in ("reply", "username", "name") and _is_visual_media(message):
         rest = re.sub(r"[\W_]+", "", _strip_mentions(text or ""))
         if len(rest) < 12:
             return True
         score, _t, _f = calculate_spam_score(text, message, ping_kind=ping_kind)
         return score >= SPAM_THRESHOLD - 15
+    # Любой пинг (ответ на наш пост, @username, имя, скрытый тег) с коммерческим
+    # следом гасим: настоящий покупатель проходит выше через veto-проверку.
+    score, _trigger, _factors = calculate_spam_score(text, message, ping_kind=ping_kind)
+    if is_ping and score >= SPAM_THRESHOLD - 15:
+        return True
     return is_spam_message(text, message, ping_kind=ping_kind)[0]
 
 def is_gatekeeper_text(text: str) -> bool:
@@ -2215,9 +2452,35 @@ def deserialize_entities(hex_list: Optional[List[str]]) -> List[Any]:
         try:
             reader = BinaryReader(bytes.fromhex(h))
             entities.append(reader.tgread_object())
-        except Exception:
+        except Exception as e:
+            # Незнакомый тип (новая фича Telegram, которой нет в этой версии
+            # Telethon) не должен молча ломать всё остальное форматирование.
+            log_info(f"[ENTITY] Сущность пропущена: {type(e).__name__}")
             continue
     return entities
+
+
+def _rebase_entities(entities: Optional[List[Any]], prefix_len: int, text_len: int) -> List[str]:
+    """Пересчитать смещения сущностей на новый текст, обрезая выход за границы."""
+    out: List[str] = []
+    for e in entities or []:
+        try:
+            off = int(getattr(e, "offset", 0)) - int(prefix_len)
+            length = int(getattr(e, "length", 0))
+            if off < 0:
+                length += off
+                off = 0
+            if length <= 0 or off >= text_len:
+                continue
+            if off + length > text_len:
+                length = text_len - off
+            ne = copy.copy(e)
+            ne.offset = off
+            ne.length = length
+            out.append(bytes(ne).hex())
+        except Exception:
+            continue
+    return out
 
 def extract_payload_and_entities(message: Any, raw_text: str, folder_name: str = "") -> Tuple[str, List[str]]:
     lines = raw_text.splitlines()
@@ -2240,17 +2503,7 @@ def extract_payload_and_entities(message: Any, raw_text: str, folder_name: str =
 
         prefix_len = len(prefix_before_text.encode("utf-16le")) // 2
         text_len = len(text.encode("utf-16le")) // 2
-        out_entities = []
-        if getattr(message, "entities", None):
-            for e in message.entities:
-                off = e.offset - prefix_len
-                if off >= 0 and (off + e.length) <= text_len:
-                    ne = copy.copy(e)
-                    ne.offset = off
-                    try:
-                        out_entities.append(bytes(ne).hex())
-                    except Exception:
-                        pass
+        out_entities = _rebase_entities(getattr(message, "entities", None), prefix_len, text_len)
         return text, out_entities
     else:
         quoted = re.findall(r'"([^"]+)"', raw_text)
@@ -2274,18 +2527,30 @@ def extract_payload_and_entities(message: Any, raw_text: str, folder_name: str =
 
         prefix_len = len(prefix.encode("utf-16le")) // 2
         text_len = len(text.encode("utf-16le")) // 2
-        out_entities = []
-        if getattr(message, "entities", None):
-            for e in message.entities:
-                off = e.offset - prefix_len
-                if off >= 0 and (off + e.length) <= text_len:
-                    ne = copy.copy(e)
-                    ne.offset = off
-                    try:
-                        out_entities.append(bytes(ne).hex())
-                    except Exception:
-                        pass
+        out_entities = _rebase_entities(getattr(message, "entities", None), prefix_len, text_len)
         return text, out_entities
+
+def _preview_disabled(message: Any, text: str) -> int:
+    """1, если у исходного поста превью ссылки было выключено.
+
+    Telegram кладёт включённое превью в message.media как MessageMediaWebPage.
+    Ссылка есть, а веб-страницы в media нет — значит превью отключили руками,
+    и при рассылке его нужно сохранить отключённым.
+    """
+    if not text or not _LINK_RE.search(text):
+        return 0
+    from telethon.tl.types import MessageMediaWebPage
+    return 0 if isinstance(getattr(message, "media", None), MessageMediaWebPage) else 1
+
+
+def _strip_trailing_buttons(text: str) -> Tuple[str, List[Any]]:
+    """Вырезать хвост с инлайн-кнопками из текста поста."""
+    try:
+        return extract_buttons_block(text)
+    except Exception as e:
+        log_error(f"[BTN] Кнопки не разобраны: {e}")
+        return text, []
+
 
 async def fetch_album(client: TelegramClient, message: Any) -> List[Any]:
     """All parts of the album `message` belongs to, sorted, without duplicates."""
@@ -2367,12 +2632,19 @@ _MEDIA_FORBIDDEN_ERRORS = tuple(
 )
 
 
+def _looks_like_markup_error(exc: BaseException) -> bool:
+    text = str(exc).upper()
+    return any(word in text for word in ("BUTTON", "REPLY_MARKUP", "KEYBOARD", "ENTITY_TYPE_INVALID"))
+
+
 async def send_single_item(
     client: TelegramClient,
     chat_peer: Any,
     text: str,
     entities_hex: List[str],
-    media_files: List[str]
+    media_files: List[str],
+    buttons: Optional[Any] = None,
+    disable_preview: bool = False,
 ):
     """
     Send one post (text, one media or one album) exactly as saved.
@@ -2380,12 +2652,16 @@ async def send_single_item(
     parse_mode=None everywhere: without it Telethon re-parsed every post as
     Markdown, so "__", "**" or "[x](y)" in an ad were silently mangled and
     album captions lost their formatting.
+
+    link_preview=False is passed explicitly when the post was saved with the
+    preview turned off, otherwise Telegram re-adds the preview card.
     """
     entities = deserialize_entities(entities_hex)
     existing_media = [p for p in (_resolve_media_path(f) for f in (media_files or []) if f) if p]
     if media_files and len(existing_media) != len(media_files):
         log_error(f"[WARN] Не найдено {len(media_files) - len(existing_media)} медиа-файл(ов) поста — отправляю что есть.")
     fmt_entities = entities if entities else None
+    markup = build_buttons_markup(buttons) if buttons else None
 
     if not text and not existing_media:
         log_error("[WARN] Пустой пост: нет текста и медиа-файлы не найдены.")
@@ -2400,6 +2676,21 @@ async def send_single_item(
                 caption=text or None,
                 formatting_entities=fmt_entities,
                 parse_mode=None,
+                buttons=markup,
+            )
+            return
+        except errors.RPCError as e:
+            if markup is None or not _looks_like_markup_error(e):
+                raise
+            # Telegram не принял разметку кнопок (например callback на
+            # юзер-аккаунте). Пост важнее кнопок — отправляем без них.
+            log_error(f"[BTN] Telegram отклонил кнопки ({e}). Отправляю пост без кнопок.")
+            await client.send_file(
+                chat_peer,
+                file=files,
+                caption=text or None,
+                formatting_entities=fmt_entities,
+                parse_mode=None,
             )
             return
         except errors.MediaCaptionTooLongError:
@@ -2407,19 +2698,36 @@ async def send_single_item(
             # after it (the only way Telegram accepts it).
             await client.send_file(chat_peer, file=files, parse_mode=None)
             if text:
-                await client.send_message(chat_peer, message=text, formatting_entities=fmt_entities, parse_mode=None)
+                await client.send_message(
+                    chat_peer, message=text, formatting_entities=fmt_entities,
+                    parse_mode=None, link_preview=not disable_preview, buttons=markup,
+                )
             return
         except _MEDIA_FORBIDDEN_ERRORS:
             if not text:
                 raise
             log_error("[MEDIA] В этом чате запрещены медиа — отправляю текст поста без вложений.")
 
-    await client.send_message(
-        chat_peer,
-        message=text,
-        formatting_entities=fmt_entities,
-        parse_mode=None,
-    )
+    try:
+        await client.send_message(
+            chat_peer,
+            message=text,
+            formatting_entities=fmt_entities,
+            parse_mode=None,
+            link_preview=not disable_preview,
+            buttons=markup,
+        )
+    except errors.RPCError as e:
+        if markup is None or not _looks_like_markup_error(e):
+            raise
+        log_error(f"[BTN] Telegram отклонил кнопки ({e}). Отправляю пост без кнопок.")
+        await client.send_message(
+            chat_peer,
+            message=text,
+            formatting_entities=fmt_entities,
+            parse_mode=None,
+            link_preview=not disable_preview,
+        )
 
 async def send_broadcast_post(
     client: TelegramClient,
@@ -2427,7 +2735,9 @@ async def send_broadcast_post(
     text: str = "",
     entities_hex: Optional[List[str]] = None,
     media_files: Optional[List[str]] = None,
-    bundle: Optional[List[Dict[str, Any]]] = None
+    bundle: Optional[List[Dict[str, Any]]] = None,
+    buttons: Optional[Any] = None,
+    disable_preview: bool = False,
 ):
     if bundle:
         clean_bundle = [item for item in bundle if not is_internal_bot_message(item.get("text", ""))]
@@ -2436,7 +2746,11 @@ async def send_broadcast_post(
             if idx > 0:
                 await asyncio.sleep(1.0)
             try:
-                await _send_bundle_item(client, chat_peer, item)
+                await _send_bundle_item(
+                    client, chat_peer, item,
+                    buttons=buttons if idx == 0 else None,
+                    disable_preview=disable_preview,
+                )
                 sent_items += 1
             except asyncio.CancelledError:
                 raise
@@ -2452,11 +2766,19 @@ async def send_broadcast_post(
             chat_peer,
             text=text,
             entities_hex=entities_hex or [],
-            media_files=media_files or []
+            media_files=media_files or [],
+            buttons=buttons,
+            disable_preview=disable_preview,
         )
 
 
-async def _send_bundle_item(client: TelegramClient, chat_peer: Any, item: Dict[str, Any]):
+async def _send_bundle_item(
+    client: TelegramClient,
+    chat_peer: Any,
+    item: Dict[str, Any],
+    buttons: Optional[Any] = None,
+    disable_preview: bool = False,
+):
     if item.get("is_forward") and item.get("forward_chat_id") and item.get("forward_msg_ids"):
         try:
             await client.forward_messages(
@@ -2477,7 +2799,9 @@ async def _send_bundle_item(client: TelegramClient, chat_peer: Any, item: Dict[s
         chat_peer,
         text=item.get("text", ""),
         entities_hex=item.get("entities_hex", []),
-        media_files=item.get("media_files", [])
+        media_files=item.get("media_files", []),
+        buttons=buttons,
+        disable_preview=disable_preview,
     )
 
 
@@ -2540,7 +2864,7 @@ async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional
 
     if has_flags:
         try:
-            async for dialog in client.iter_dialogs(limit=1000):
+            async for dialog in client.iter_dialogs(limit=5000):
                 cid = dialog.id
                 if cid in exclude_ids:
                     continue
@@ -2563,8 +2887,8 @@ async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional
 
                 if matched:
                     chat_ids.add(cid)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"[FOLDER] Не удалось прочитать список диалогов папки \"{folder_name}\": {type(e).__name__}: {e}")
 
     return [cid for cid in chat_ids if cid not in exclude_ids]
 
@@ -2655,18 +2979,53 @@ async def join_and_silence_target(
 
 
 # Highest message id of a *genuine* ping (real reply / mention from a person)
-# per (account, chat). Used so that clearing a spam ping never marks a real,
-# still-unread reply as read.
-_GENUINE_PINGS: Dict[Tuple[int, int], int] = {}
+# per (account, chat) plus the time we saw it. Clearing a spam ping must not
+# silently mark a real lead as read, but it also must not be blocked forever.
+GENUINE_PING_TTL = 1800
+_GENUINE_PINGS: Dict[Tuple[int, int], Any] = {}
+_PRESERVED_PINGS: Set[Tuple[int, int, int]] = set()
+
+
+def _pending_ping(key: Tuple[int, int]) -> Tuple[int, float]:
+    raw = _GENUINE_PINGS.get(key)
+    if raw is None:
+        return 0, 0.0
+    if isinstance(raw, (tuple, list)):
+        try:
+            return int(raw[0]), float(raw[1] or 0.0)
+        except Exception:
+            return 0, 0.0
+    try:
+        return int(raw), 0.0
+    except Exception:
+        return 0, 0.0
 
 
 def note_genuine_ping(account_id: int, chat_id: int, msg_id: int):
     key = (account_id, chat_id)
-    if msg_id and msg_id > _GENUINE_PINGS.get(key, 0):
-        _GENUINE_PINGS[key] = msg_id
+    old_id, _old_ts = _pending_ping(key)
+    if msg_id and msg_id > old_id:
+        _GENUINE_PINGS[key] = (msg_id, time.time())
     if len(_GENUINE_PINGS) > 5000:
         for k in list(_GENUINE_PINGS)[:1000]:
             _GENUINE_PINGS.pop(k, None)
+
+
+async def _preserve_ping(client: TelegramClient, input_peer: Any, chat_key: Any, msg_id: int, account_id: int) -> bool:
+    """Скопировать живой пинг в «Избранное», чтобы не потерять лид при чтении чата."""
+    key = (int(account_id or 0), int(chat_key or 0), int(msg_id or 0))
+    if key in _PRESERVED_PINGS:
+        return True
+    try:
+        await client.forward_messages("me", msg_id, from_peer=input_peer)
+        _PRESERVED_PINGS.add(key)
+        if len(_PRESERVED_PINGS) > 1000:
+            _PRESERVED_PINGS.clear()
+        log_info(f"[ANTISPAM] Живой пинг {msg_id} сохранён в Избранное, чат можно читать.")
+        return True
+    except Exception as e:
+        log_info(f"[ANTISPAM] Пинг {msg_id} не сохранён ({type(e).__name__}), историю не трогаю.")
+        return False
 
 
 async def _resolve_input_peer(client: TelegramClient, chat_peer: Any, message: Any):
@@ -2773,15 +3132,19 @@ async def clear_spam_mention(
 
     # Is a real ping in this chat still unread? Then leave the history alone.
     key_chat = chat_id if chat_id is not None else getattr(message, "chat_id", None)
-    pending_real = _GENUINE_PINGS.get((account_id, key_chat), 0) if key_chat is not None else 0
-    if pending_real and pending_real < msg_id:
+    pending_id, pending_ts = _pending_ping((account_id, key_chat)) if key_chat is not None else (0, 0.0)
+    if pending_id and pending_id < msg_id:
         try:
             res = await client(GetPeerDialogsRequest(peers=[InputDialogPeer(peer=input_peer)]))
             read_max = res.dialogs[0].read_inbox_max_id if getattr(res, "dialogs", None) else 0
         except Exception:
             read_max = 0
-        if pending_real > read_max:
-            return
+        if pending_id > read_max:
+            expired = pending_ts and (time.time() - pending_ts) > GENUINE_PING_TTL
+            if not expired and not await _preserve_ping(client, input_peer, key_chat, pending_id, account_id):
+                return
+            if expired:
+                log_info(f"[ANTISPAM] Живой пинг {pending_id} протух, читаю чат дальше.")
         _GENUINE_PINGS.pop((account_id, key_chat), None)
 
     try:
@@ -2791,6 +3154,105 @@ async def clear_spam_mention(
             await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
     except Exception:
         pass
+
+
+_MUTE_WARN_COOLDOWN: Dict[Tuple[int, int], float] = {}
+
+
+async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any, chat_id: Optional[int] = None):
+    """Снять с сообщения упоминание и прочитать его.
+
+    send_read_acknowledge в Telethon 1.45 делает только readHistory, поэтому
+    бейдж упоминания оставался. Здесь явно: readMessageContents (снимает
+    упоминание по конкретному id), затем readHistory до этого сообщения
+    (убирает пуш и счётчик непрочитанного).
+    """
+    msg_id = getattr(message, "id", 0) or 0
+    if not msg_id:
+        return
+    target = chat_peer if chat_peer is not None else chat_id
+    if target is None:
+        return
+    input_peer = await _resolve_input_peer(client, target, message)
+    if input_peer is None:
+        return
+    from telethon.tl.types import InputPeerChannel
+    from telethon.tl.functions.messages import (
+        ReadHistoryRequest as MessagesReadHistoryRequest,
+        ReadMessageContentsRequest as MessagesReadContentsRequest,
+    )
+    from telethon.tl.functions.channels import (
+        ReadHistoryRequest as ChannelReadHistoryRequest,
+        ReadMessageContentsRequest as ChannelReadContentsRequest,
+    )
+    is_channel = isinstance(input_peer, InputPeerChannel)
+    try:
+        if is_channel:
+            await client(ChannelReadContentsRequest(channel=utils.get_input_channel(input_peer), id=[msg_id]))
+        else:
+            await client(MessagesReadContentsRequest(id=[msg_id]))
+    except Exception as e:
+        log_info(f"[READ] readMessageContents не прошёл ({type(e).__name__})")
+    try:
+        if is_channel:
+            await client(ChannelReadHistoryRequest(channel=utils.get_input_channel(input_peer), max_id=msg_id))
+        else:
+            await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
+    except Exception as e:
+        log_info(f"[READ] readHistory не прошёл ({type(e).__name__})")
+
+
+async def apply_mute_action(
+    client: TelegramClient,
+    message: Any,
+    account_id: int,
+    chat_id: Optional[int],
+    action: str = "silent",
+):
+    """Реакция на сообщение заглушённого человека.
+
+    Уведомление уже улетело на телефон, когда апдейт дошёл до нас, поэтому
+    первым делом сообщение помечается прочитанным: Telegram убирает бейдж и
+    гасит пуш. Дальше — то, что выбрал владелец: удалить, предупредить, бан.
+    """
+    if message is None:
+        return
+    action = (action or "silent").lower()
+    if action not in MUTE_ACTIONS:
+        action = "silent"
+
+    await mark_message_read(client, getattr(message, "input_chat", None) or chat_id, message, chat_id)
+
+    msg_id = getattr(message, "id", None)
+    if action == "delete" and msg_id:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception as e:
+            log_info(f"[MUTE] Не удалось удалить сообщение {msg_id}: {type(e).__name__}")
+        return
+
+    if action == "warn":
+        key = (int(account_id or 0), int(_strip_peer_id(getattr(message, "sender_id", 0) or 0)))
+        now = time.time()
+        if now - _MUTE_WARN_COOLDOWN.get(key, 0.0) > 600:
+            _MUTE_WARN_COOLDOWN[key] = now
+            try:
+                await client.send_message(
+                    chat_id,
+                    "Тебя не слышно: этот человек в игноре. Не пингуй.",
+                    reply_to=msg_id,
+                )
+            except Exception:
+                pass
+        return
+
+    if action == "ban":
+        sender_id = getattr(message, "sender_id", None)
+        if sender_id:
+            try:
+                await client.edit_permissions(chat_id, sender_id, view_messages=False)
+            except Exception as e:
+                log_info(f"[MUTE] Бан не сработал в чате {chat_id}: {type(e).__name__}")
 
 
 class PartialSendError(Exception):
@@ -2837,6 +3299,12 @@ class BroadcasterService:
         self._bg_tasks: Set[asyncio.Task] = set()
         self._folder_missing: Dict[Tuple[str, str], int] = {}
         self._force_folder_sync = False
+        self._last_folder_sync = 0.0
+        self._wake_event: Optional[asyncio.Event] = None
+
+    def _wakeup(self):
+        if self._wake_event is not None:
+            self._wake_event.set()
 
     # ------------------------------------------------------------------ life
     def start(self):
@@ -2855,10 +3323,15 @@ class BroadcasterService:
             return
         self.is_running = True
         try:
+            db.reset_pending_sends(self.account_id)
+        except Exception:
+            pass
+        try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is not None:
+            self._wake_event = asyncio.Event()
             self._task = loop.create_task(self._loop())
 
     def stop(self):
@@ -2871,6 +3344,7 @@ class BroadcasterService:
         self._bg_tasks.clear()
         self._sending_chats.clear()
         self._folder_cache.clear()
+        self._wake_event = None
         if BroadcasterService._ACTIVE_INSTANCES.get(self.account_id) is self:
             BroadcasterService._ACTIVE_INSTANCES.pop(self.account_id, None)
 
@@ -2914,7 +3388,8 @@ class BroadcasterService:
                 # instead of broadcasting into them forever.
                 misses = self._folder_missing.get(cache_key, 0) + 1
                 self._folder_missing[cache_key] = misses
-                if misses < 3:
+                if misses < 10:
+                    log_info(f"[FOLDER] Папка \"{folder_name}\" не читается ({misses}/10), чаты пока не трогаю.")
                     continue
                 live_chats = []
             else:
@@ -2937,6 +3412,7 @@ class BroadcasterService:
                         folder_name=folder_name,
                     ):
                         enrolled_total += 1
+                        log_info(f"[FOLDER] Новый чат {cid} добавлен в рассылку '{template_name}' (папка \"{folder_name}\")")
                 except Exception as e:
                     log_error(f"[FOLDER] Не удалось добавить чат {cid} в рассылку \"{template_name}\": {e}")
 
@@ -2957,11 +3433,26 @@ class BroadcasterService:
         return enrolled_total
 
     # ------------------------------------------------------------ scheduler
+    async def _sleep(self, wait: float) -> None:
+        """Спать до ближайшего события или таймаута, без опроса базы каждую секунду."""
+        wait = max(float(wait), 0.2)
+        if self._wake_event is None:
+            await asyncio.sleep(wait)
+            return
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._wake_event is not None:
+                self._wake_event.clear()
+
     async def _loop(self):
         import gc
         last_gc = time.time()
         last_collector_clean = time.time()
-        last_folder_sync = 0.0
 
         while self.is_running:
             try:
@@ -2973,16 +3464,16 @@ class BroadcasterService:
                 if now - last_gc > 600:
                     gc.collect()
                     last_gc = now
-                if self._force_folder_sync or now - last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
+                if self._force_folder_sync or now - self._last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
                     self._force_folder_sync = False
-                    last_folder_sync = now
+                    self._last_folder_sync = now
                     try:
                         await self.sync_folder_broadcasts()
                     except Exception as e:
                         log_error(f"[FOLDER] Ошибка синхронизации папок: {e}")
 
                 if now < self._flood_until:
-                    await asyncio.sleep(min(5.0, self._flood_until - now))
+                    await self._sleep(min(5.0, self._flood_until - now))
                     continue
 
                 for task in db.get_active_interval_tasks(account_id=self.account_id):
@@ -3002,7 +3493,7 @@ class BroadcasterService:
                     if await self._deliver(task):
                         await asyncio.sleep(self.PAUSE_BETWEEN_CHATS)
 
-                await asyncio.sleep(self._next_wake())
+                await self._sleep(self._next_wake())
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3010,25 +3501,35 @@ class BroadcasterService:
                 await asyncio.sleep(3.0)
 
     def _next_wake(self) -> float:
+        now = time.time()
         try:
             tasks = db.get_active_interval_tasks(account_id=self.account_id)
             retry_at = db.next_retry_at(account_id=self.account_id)
         except Exception:
             return 5.0
-        wait = 5.0
-        now = time.time()
+        # Потолок в 30 секунд: если сон длиннее, событие вроде смены сети или
+        # возврата из Doze всё равно должно быстро разбудить планировщик.
+        wait = 30.0
         for t in tasks:
+            mode = t.get("mode", "interval")
+            if mode == "hybrid":
+                if int(t.get("current_count") or 0) < max(int(t.get("counter_threshold") or 0), 1):
+                    continue
             left = (t.get("interval_seconds") or 0) - (now - (t.get("last_sent_at") or 0))
-            wait = min(wait, max(left, 0.0))
+            wait = min(wait, max(left, 0.2))
         if retry_at:
-            wait = min(wait, max(retry_at - now, 0.0))
-        return max(1.0, wait)
+            wait = min(wait, max(retry_at - now, 0.2))
+        folder_left = self.FOLDER_SYNC_INTERVAL - (now - self._last_folder_sync)
+        if folder_left > 0:
+            wait = min(wait, folder_left)
+        return max(0.2, wait)
 
     async def _run_scheduled(self, task: Dict[str, Any]) -> bool:
         """Claim a due interval/hybrid task atomically, then send it."""
         mode = task.get("mode", "interval")
         if mode == "hybrid":
-            claimed = db.claim_hybrid_task(task["id"], time.time())
+            interval = int(task.get("interval_seconds") or 0)
+            claimed = db.claim_hybrid_task(task["id"], time.time(), stale_after=max(interval * 3, 1800))
         else:
             claimed = db.claim_interval_task(task["id"], time.time())
         if not claimed:
@@ -3043,6 +3544,7 @@ class BroadcasterService:
         t = asyncio.ensure_future(self.handle_counter_event(chat_id))
         self._bg_tasks.add(t)
         t.add_done_callback(self._bg_tasks.discard)
+        self._wakeup()
 
     async def handle_counter_event(self, chat_id: int):
         # increment_and_check_counter() resets the counter in the same
@@ -3055,6 +3557,9 @@ class BroadcasterService:
         for task in ready:
             if time.time() < self._flood_until:
                 db.schedule_retry(task, delay=self._flood_until - time.time() + 2, failed=False)
+                continue
+            # Атомарный claim: два события подряд не отправят пост дважды.
+            if not db.claim_counter_task(task["id"], time.time()):
                 continue
             await self._deliver(task)
 
@@ -3087,6 +3592,8 @@ class BroadcasterService:
             db.schedule_retry(task, delay=self._backoff(task, self.RETRY_DELAY, cap=3600))
         elif outcome == "busy":
             db.schedule_retry(task, delay=5.0, failed=False)
+        elif outcome == "skip":
+            db.clear_pending(task["id"])
         return outcome == "sent"
 
     async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> str:
@@ -3126,6 +3633,8 @@ class BroadcasterService:
                     entities_hex=template["entities_hex"],
                     media_files=template["media_files"],
                     bundle=template.get("bundle"),
+                    buttons=template.get("buttons"),
+                    disable_preview=bool(template.get("disable_preview")),
                 )
                 self._last_sent_chat[chat_id] = time.time()
                 return "sent"
@@ -3231,13 +3740,30 @@ HELP_TEXT = """
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
 
 **9. Заглушение конкретных людей:**
-* `.мутить` — ответьте командой на сообщение (самый точный способ)
-* `.мутить `@username`
-* `.мутить 123456789`
-* `.мутить 123456789 причина` — сохранит причину
-* `.размутить `@username` или `.размутить 123456789`
-* `.заглушенные` — список всех как заглушены
+• `.мутить` — ответьте командой на сообщение (самый точный способ)
+• `.мутить @username` / `.мутить 123456789` — тихий режим: сообщения помечаются прочитанными, пинг и уведомление снимаются
+• `.мутить @username удалить` — его сообщения сразу удаляются
+• `.мутить @username варн` — бот отвечает предупреждением
+• `.мутить @username бан` — снимает право писать (нужны права админа)
+• `.мутить чат` — тишина во всём этом чате
+• `.размутить @username` / `.заглушенные` — снять мьют и посмотреть список
 *(Заглушенные не запускают авто-подписку и не увеличивают счётчик рассылки)*
+
+**10. Кнопки под постом:**
+• `.кнопки <название>` — пришли раскладку одним сообщением, одна строка = один ряд:
+  `[Купить](https://t.me/manager) || [Прайс](https://t.me/price)`
+  `[Написать](cb:hello)` — `cb:` делает callback-кнопку
+• `.кнопки очистить <название>` — убрать кнопки
+
+**11. Превью ссылок:**
+• `.превью выкл <название>` — рассылать без карточки ссылки
+• `.превью вкл <название>` — вернуть превью
+*(Если пост собран из сообщения, где превью уже было выключено, бот запомнит это сам)*
+
+**12. Служебное:**
+• `.версия` — версия бота
+• `.рассылки` — все рассылки аккаунта
+• `.синк` — перечитать папки и подхватить новые чаты сразу
 """
 
 def _extract_collector_flag(text: str) -> Tuple[Optional[str], str]:
@@ -3534,54 +4060,52 @@ async def classify_ping(event: Any, message: Any, text: str, my_id: int,
     """
     How a message reached us: "reply", "username", "name", "stealth" or None.
 
-    "stealth" = Telegram flagged it as mentioning us but it is neither a reply
-    to our message nor a visible @username / name mention. That is exactly the
-    hidden-tag trick spammers use, and it is always cleared.
+    A reply to our own post is a ping even without @username or an entity: the
+    old gate returned None before it ever looked at the reply, so ads sent as
+    answers to our message were never cleared. "stealth" stays as it was: a
+    mention Telegram flags but that is neither a reply nor a visible @handle.
     """
     mentioned = bool(getattr(message, "mentioned", False))
     typed_username = bool(text) and any(
         re.search(rf"(?<![\w@])@{re.escape(u)}(?!\w)", text, re.IGNORECASE) for u in usernames if u
     )
     ent_kind = _mention_entity_kind(text, message, my_id, names, usernames)
-    if not mentioned and not typed_username and ent_kind is None:
-        return None
 
-    if ent_kind == "hidden":
-        return "stealth"
-
-    reply_unknown = False
+    reply_is_ours = False
     if getattr(event, "is_reply", False):
         try:
             reply_msg = await event.get_reply_message()
         except Exception:
             reply_msg = None
-        if reply_msg is None:
-            reply_unknown = True
-        elif getattr(reply_msg, "sender_id", None) == my_id or getattr(reply_msg, "out", False):
-            return "reply"
+        if reply_msg is not None and (
+            getattr(reply_msg, "sender_id", None) == my_id or getattr(reply_msg, "out", False)
+        ):
+            reply_is_ours = True
 
     if ent_kind == "hidden":
         return "stealth"
+    if reply_is_ours:
+        return "reply"
     if typed_username:
         return "username"
     if ent_kind == "name":
         return "name"
     if mentioned:
-        # A reply whose original we could not load (other chat / deleted)
-        # is given the benefit of the doubt.
-        return "unknown" if reply_unknown else "stealth"
+        return "stealth"
     return None
 
 
 def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_id: int, acc_cfg: Optional[Dict[str, Any]] = None):
     # Always keep client's broadcaster reference current
+    client._colemailer_broadcaster = broadcaster
     client._spambuster_broadcaster = broadcaster
 
     # Guard against duplicate handler registration on client reconnection or re-init
-    if getattr(client, "_spambuster_events_registered", False):
+    if getattr(client, "_colemailer_events_registered", False):
         log_info(f"[LIFECYCLE] Обработчики событий уже зарегистрированы для клиента {my_id}. Пропуск повторной регистрации.")
         return
 
+    client._colemailer_events_registered = True
     client._spambuster_events_registered = True
 
     if acc_cfg is None:
@@ -3618,9 +4142,17 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
 
-        active_broadcaster = getattr(client, "_spambuster_broadcaster", broadcaster)
-        if is_peer_muted(my_id, sender_id, chat_id):
-            log_info(f"[MUTE] Чат {chat_id}: сообщение от {sender_id} скрыто по списку мута.")
+        active_broadcaster = getattr(client, "_colemailer_broadcaster", broadcaster)
+        mute_action = mute_action_for(my_id, sender_id, chat_id)
+        if mute_action:
+            if mute_scope_for(my_id, sender_id, chat_id) == "chat" and mute_action in ("ban", "warn"):
+                # В чате нельзя банить/предупреждать всех подряд — только тишина.
+                mute_action = "silent"
+            log_info(f"[MUTE] Чат {chat_id}: сообщение от {sender_id}, действие '{mute_action}'.")
+            if mute_action != "silent":
+                await apply_mute_action(client, event.message, my_id, chat_id, mute_action)
+            else:
+                await mark_message_read(client, getattr(event, "input_chat", None) or chat_id, event.message, chat_id)
             return
 
         # Counter broadcasts run in the background: a slow media upload must
@@ -3685,6 +4217,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
         if is_peer_muted(my_id, sender_id, event.chat_id):
+            await mark_message_read(
+                client, getattr(event, "input_chat", None) or event.chat_id, event.message, event.chat_id
+            )
             return
         text = event.raw_text or ""
         message = event.message
@@ -3696,9 +4231,20 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                             ping_kind=kind if kind != "unknown" else None):
             await clear_spam_mention(client, getattr(event, "input_chat", None) or event.chat_id,
                                      message, account_id=my_id, chat_id=event.chat_id,
-                                     protect_unread_history=True)
+                                     protect_unread_history=kind is None)
         elif kind is not None:
             note_genuine_ping(my_id, event.chat_id, event.id)
+
+    @client.on(events.Raw())
+    async def folder_update_handler(update: Any):
+        """Папку поправили на другом устройстве — сразу пересобрать список чатов."""
+        name = type(update).__name__
+        if "DialogFilter" in name or "FolderPeer" in name:
+            current = getattr(client, "_colemailer_broadcaster", broadcaster)
+            try:
+                current.request_folder_sync()
+            except Exception:
+                pass
 
     @client.on(events.NewMessage())
     async def command_dispatcher(event: Any):
@@ -3759,7 +4305,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     ".закончить", ".завершить", ".готово",
                     ".мутить", ".мут", ".mute", ".ignore",
                     ".размутить", ".размут", ".unmute", ".unignore",
-                    ".заглушенные", ".мутлист", ".mutelist", ".рассылки", ".broadcasts"
+                    ".заглушенные", ".мутлист", ".mutelist", ".рассылки", ".broadcasts",
+                    ".кнопки", ".buttons", ".превью", ".preview",
+                    ".синк", ".sync", ".версия", ".version"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -3779,6 +4327,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         if cmd in (".инструкция", ".help"):
             await _notify(event, HELP_TEXT, auto_delete=0)
+            return
+
+        if cmd in (".версия", ".version"):
+            await _notify(event, f"{APP_NAME} {APP_VERSION}", auto_delete=20)
             return
 
         if cmd in (".рассыл", ".broadcast"):
@@ -3837,6 +4389,24 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             await handle_list_all(event)
             return
 
+        if cmd in (".кнопки", ".buttons"):
+            await handle_buttons_command(event, raw)
+            return
+
+        if cmd in (".превью", ".preview"):
+            await handle_preview_command(event, raw)
+            return
+
+        if cmd in (".синк", ".sync", ".папки-обновить"):
+            active_b = getattr(client, "_colemailer_broadcaster", None) or broadcaster
+            try:
+                added = await active_b.sync_folder_broadcasts()
+            except Exception as e:
+                await _notify(event, f"⚠️ Синхронизация не удалась: {type(e).__name__}: {e}")
+                return
+            await _notify(event, f"🔄 Папки перечитаны. Новых чатов в рассылках: {added}.")
+            return
+
     async def handle_collector_start(event: Any, raw: str, session_type: str):
         mode, interval_sec, threshold_count, template_name, folder_name, err = parse_broadcast_params(raw.splitlines()[0])
         if err:
@@ -3882,7 +4452,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     "is_forward": is_fwd,
                     "forward_chat_id": reply_msg.chat_id,
                     "forward_msg_ids": msg_ids,
-                    "grouped_id": grouped_id
+                    "grouped_id": grouped_id,
+                    "disable_preview": _preview_disabled(caption_msg, text),
                 })
 
         collector_key = (my_id, chat_id)
@@ -3926,6 +4497,34 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 _BOT_SYSTEM_MSG_IDS.add(msg.id)
             return
 
+        if session.get("session_type") == "buttons":
+            from cole.buttons import ButtonError, parse_row
+            rows: List[Any] = []
+            try:
+                for line in text.splitlines():
+                    if not line.strip():
+                        continue
+                    row = parse_row(line)
+                    if row:
+                        rows.append(row)
+            except ButtonError as e:
+                await _notify(event, f"⚠️ Кнопки не разобраны: {e}\nПопробуй ещё раз.")
+                return
+            name = session["template_name"]
+            tpl = db.get_template(name)
+            if not rows or not tpl:
+                await _notify(event, "⚠️ Не вижу ни одной кнопки. Пример: `[Купить](https://t.me/manager)`")
+                return
+            db.save_template(
+                name, tpl["text"], tpl["entities_hex"], tpl["media_files"],
+                bundle_json=json.dumps(tpl["bundle"], ensure_ascii=False) if tpl.get("bundle") else "",
+                buttons_json=buttons_to_json(rows), disable_preview=tpl.get("disable_preview") or 0,
+            )
+            ACTIVE_COLLECTORS.pop((my_id, event.chat_id), None)
+            ACTIVE_COLLECTORS.pop(event.chat_id, None)
+            await _notify(event, f"✅ Кнопки для **{name}** сохранены:\n{describe_buttons(rows)}")
+            return
+
         session["last_active"] = time.time()
         template_name = session["template_name"]
         grouped_id = getattr(msg, "grouped_id", None)
@@ -3954,6 +4553,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 "forward_chat_id": event.chat_id,
                 "forward_msg_ids": [msg.id],
                 "grouped_id": grouped_id,
+                "disable_preview": _preview_disabled(msg, text),
             }
             albums[grouped_id] = item
             session["items"].append(item)
@@ -3997,7 +4597,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             "is_forward": is_fwd,
             "forward_chat_id": event.chat_id,
             "forward_msg_ids": [msg.id],
-            "grouped_id": grouped_id
+            "grouped_id": grouped_id,
+            "disable_preview": _preview_disabled(msg, text),
         }
         placeholder.update(item)
         count = item_index + 1
@@ -4035,9 +4636,23 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         root_text = first.get("text", "")
         root_entities = first.get("entities_hex", [])
         root_media = first.get("media_files", [])
-        bundle_json = json.dumps(items)
+        buttons_rows: List[Any] = []
+        if items:
+            last_text = items[-1].get("text", "") or ""
+            trimmed, buttons_rows = _strip_trailing_buttons(last_text)
+            if buttons_rows:
+                items[-1]["text"] = trimmed
+                if items[-1] is first:
+                    root_text = trimmed
+        disable_preview = 1 if any(int(it.get("disable_preview") or 0) for it in items) else 0
+        bundle_json = json.dumps(items, ensure_ascii=False)
 
-        db.save_template(template_name, root_text, root_entities, root_media, bundle_json=bundle_json)
+        db.save_template(
+            template_name, root_text, root_entities, root_media,
+            bundle_json=bundle_json,
+            buttons_json=buttons_to_json(buttons_rows),
+            disable_preview=disable_preview,
+        )
 
         folder_name = session["folder_name"]
         mode = session["mode"]
@@ -4108,6 +4723,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         text = ""
         entities_hex = []
         media_files = []
+        buttons_rows: List[Any] = []
+        disable_preview = 0
 
         if event.is_reply:
             reply_msg = await event.get_reply_message()
@@ -4126,16 +4743,22 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     text = reply_msg.raw_text or ""
                     entities_hex = serialize_entities(reply_msg.entities)
 
+                disable_preview = _preview_disabled(reply_msg, text)
                 media_files = await save_media_from_message(client, reply_msg, template_name, clear_existing=True)
 
             cmd_text, cmd_entities = extract_payload_and_entities(event.message, raw, folder_name)
             if cmd_text:
                 text = cmd_text
                 entities_hex = cmd_entities
+                disable_preview = 0
         else:
             text, entities_hex = extract_payload_and_entities(event.message, raw, folder_name)
             if getattr(event.message, "media", None):
                 media_files = await save_media_from_message(client, event.message, template_name, clear_existing=True)
+            if not media_files:
+                disable_preview = _preview_disabled(event.message, text)
+
+        text, buttons_rows = _strip_trailing_buttons(text)
 
         existing = db.get_template(template_name)
         named_rot = db.get_named_rotation(template_name, account_id=my_id)
@@ -4144,12 +4767,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 text = existing["text"]
                 entities_hex = existing["entities_hex"]
                 media_files = existing["media_files"]
+                buttons_rows = existing.get("buttons") or []
+                disable_preview = int(existing.get("disable_preview") or 0)
             elif named_rot:
                 pass
             else:
                 await _notify(event, "⚠️ Нет текста или медиа. Ответьте командой на сообщение с рекламой или укажите текст со следующей строки.")
                 return
 
+        existing_bundle_json = json.dumps(existing["bundle"], ensure_ascii=False) if existing and existing.get("bundle") else ""
         content_is_new = bool(text or media_files) and not (
             existing and text == existing["text"] and media_files == existing["media_files"]
             and entities_hex == existing["entities_hex"]
@@ -4158,7 +4784,19 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             # Only when new content was given: re-saving the old text used to
             # wipe the saved multi-message bundle, so a pack of posts turned
             # into its first message only.
-            db.save_template(template_name, text, entities_hex, media_files)
+            db.save_template(
+                template_name, text, entities_hex, media_files,
+                bundle_json=existing_bundle_json,
+                buttons_json=buttons_to_json(buttons_rows),
+                disable_preview=disable_preview,
+            )
+        elif existing and (buttons_rows or disable_preview):
+            db.save_template(
+                template_name, existing["text"], existing["entities_hex"], existing["media_files"],
+                bundle_json=existing_bundle_json,
+                buttons_json=buttons_to_json(buttons_rows) or buttons_to_json(existing.get("buttons")),
+                disable_preview=disable_preview or int(existing.get("disable_preview") or 0),
+            )
 
         target_chats = []
         if folder_name:
@@ -4273,6 +4911,108 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             else:
                 await _notify(event, f"⚠️ Чередование **{target_name}** не найдено.")
 
+    async def handle_buttons_command(event: Any, raw: str):
+        """`.кнопки <пост>` — задать инлайн-кнопки и их раскладку."""
+        lines = raw.splitlines()
+        words = lines[0].split()
+        if len(words) < 2:
+            await _notify(
+                event,
+                "⚠️ Формат: `.кнопки <название поста>`\n"
+                "Потом пришли одним сообщением раскладку, по строке на ряд:\n"
+                "`[Купить](https://t.me/manager) || [Прайс](https://t.me/price)`\n"
+                "`[Написать](cb:hello)`\n"
+                "`cb:` — callback-кнопка, без него — ссылка.\n"
+                "`.кнопки очистить <название>` убирает кнопки.",
+            )
+            return
+        if words[1].lower() in ("очистить", "clear", "удалить"):
+            name = " ".join(words[2:]).strip("<>\"' ")
+            tpl = db.get_template(name) if name else None
+            if not tpl:
+                await _notify(event, "⚠️ Укажи название поста: `.кнопки очистить promo`")
+                return
+            db.save_template(
+                name, tpl["text"], tpl["entities_hex"], tpl["media_files"],
+                bundle_json=json.dumps(tpl["bundle"], ensure_ascii=False) if tpl.get("bundle") else "",
+                buttons_json="", disable_preview=tpl.get("disable_preview") or 0,
+            )
+            await _notify(event, f"🧹 Кнопки у поста **{name}** убраны.")
+            return
+
+        name = " ".join(words[1:]).strip("<>\"' ")
+        tpl = db.get_template(name)
+        if not tpl:
+            await _notify(event, f"⚠️ Пост **{name}** не найден. Сначала создай рассылку с этим названием.")
+            return
+
+        from cole.buttons import ButtonError, parse_row
+        rows: List[Any] = []
+        try:
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                row = parse_row(line)
+                if row:
+                    rows.append(row)
+        except ButtonError as e:
+            await _notify(event, f"⚠️ Кнопки не разобраны: {e}")
+            return
+
+        if rows:
+            db.save_template(
+                name, tpl["text"], tpl["entities_hex"], tpl["media_files"],
+                bundle_json=json.dumps(tpl["bundle"], ensure_ascii=False) if tpl.get("bundle") else "",
+                buttons_json=buttons_to_json(rows), disable_preview=tpl.get("disable_preview") or 0,
+            )
+            await _notify(event, f"✅ Кнопки сохранены:\n{describe_buttons(rows)}")
+            return
+
+        ACTIVE_COLLECTORS[(my_id, event.chat_id)] = {
+            "account_id": my_id,
+            "chat_id": event.chat_id,
+            "template_name": name,
+            "mode": "buttons",
+            "interval_seconds": 0,
+            "counter_threshold": 0,
+            "folder_name": "",
+            "session_type": "buttons",
+            "items": [],
+            "started_at": time.time(),
+            "last_active": time.time(),
+        }
+        await _notify(
+            event,
+            f"🔘 Пришли раскладку кнопок для **{name}** одним сообщением.\n"
+            "Одна строка — один ряд, кнопки в ряду через `||`:\n"
+            "`[Купить](https://t.me/manager) || [Прайс](https://t.me/price)`\n"
+            "`[Написать](cb:hello)`",
+            auto_delete=0,
+        )
+
+    async def handle_preview_command(event: Any, raw: str):
+        """`.превью вкл|выкл <пост>` — превью ссылок при рассылке."""
+        words = raw.split()
+        if len(words) < 3:
+            await _notify(event, "⚠️ Формат: `.превью выкл promo` или `.превью вкл promo`")
+            return
+        state = words[1].lower()
+        name = " ".join(words[2:]).strip("<>\"' ")
+        tpl = db.get_template(name)
+        if not tpl:
+            await _notify(event, f"⚠️ Пост **{name}** не найден.")
+            return
+        value = {"выкл": 1, "off": 1, "0": 1, "вкл": 0, "on": 0, "1": 0}.get(state)
+        if value is None:
+            await _notify(event, "⚠️ Вторым словом должно быть `вкл` или `выкл`.")
+            return
+        db.save_template(
+            name, tpl["text"], tpl["entities_hex"], tpl["media_files"],
+            bundle_json=json.dumps(tpl["bundle"], ensure_ascii=False) if tpl.get("bundle") else "",
+            buttons_json=buttons_to_json(tpl.get("buttons")), disable_preview=value,
+        )
+        await _notify(event, f"{'🚫 Превью ссылок выключено' if value else '🖼 Превью ссылок включено'} для **{name}**.")
+
     async def _resolve_mute_target(event: Any, raw_args: str) -> Optional[Dict[str, Any]]:
         """
         Resolve a mute target from a command argument.
@@ -4378,7 +5118,40 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
     async def handle_mute(event: Any, raw: str):
         _, args = _extract_quoted_folder(raw)
-        target = await _resolve_mute_target(event, _strip_command_word(args))
+        args = _strip_command_word(args).strip()
+        words = [w for w in args.split() if w]
+        action = "silent"
+        rest_words: List[str] = []
+        chat_scope = False
+        for word in words:
+            low = word.lower()
+            if low in MUTE_ACTION_ALIASES:
+                action = MUTE_ACTION_ALIASES[low]
+                continue
+            if low in ("чат", "chat", "беседа"):
+                chat_scope = True
+                continue
+            rest_words.append(word)
+        rest = " ".join(rest_words).strip()
+
+        if chat_scope:
+            title = ""
+            try:
+                entity = await event.get_chat()
+                title = getattr(entity, "title", "") or ""
+            except Exception:
+                pass
+            target = {
+                "peer_id": event.chat_id,
+                "peer_key": event.chat_id,
+                "username": "",
+                "display_name": title or f"чат {event.chat_id}",
+                "scope": "chat",
+                "reason": rest,
+            }
+        else:
+            target = await _resolve_mute_target(event, rest)
+
         if not target:
             await _notify(
                 event,
@@ -4387,7 +5160,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 "• `.мутить` — ответьте командой на сообщение\n"
                 "• `.мутить @username`\n"
                 "• `.мутить 123456789`\n"
-                "• `.мутить 123456789 причина`",
+                "• `.мутить @username удалить` — удалять его сообщения\n"
+                "• `.мутить @username варн` — предупреждать в ответ\n"
+                "• `.мутить @username бан` — снимать право писать (нужны права)\n"
+                "• `.мутить чат` — тишина в этом чате",
             )
             return
 
@@ -4399,17 +5175,33 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             display_name=target["display_name"],
             scope=target["scope"],
             reason=target["reason"],
+            action=action,
         )
         mute_cache_rebuild(my_id)
-        verb = "Заглушен" if added else "Уже был заглушен"
+        verb = "Заглушен" if added else "Обновлён мьют"
+        action_hint = {
+            "silent": "сообщения помечаются прочитанными, пинг снимается",
+            "delete": "сообщения удаляются",
+            "warn": "в ответ уходит предупреждение",
+            "ban": "снимается право писать в чате",
+        }.get(action, action)
         reason_str = f"\nПричина: {target['reason']}" if target["reason"] else ""
-        await _notify(event, f"🔇 {verb}: **{target['display_name']}**{reason_str}")
+        await _notify(event, f"🔇 {verb}: **{target['display_name']}**\nРежим: {action_hint}{reason_str}")
 
     async def handle_unmute(event: Any, raw: str):
         _, args = _extract_quoted_folder(raw)
         args_clean = _strip_command_word(args).strip()
         if not args_clean:
             await _notify(event, "⚠️ Укажите @username или id, либо ответьте командой на сообщение.")
+            return
+
+        if args_clean.lower() in ("чат", "chat", "беседа"):
+            removed = db.remove_muted_peer(event.chat_id, account_id=my_id, scope="chat")
+            mute_cache_rebuild(my_id)
+            if removed:
+                await _notify(event, "🔊 Чат разглушен.")
+            else:
+                await _notify(event, "ℹ️ Этот чат не был заглушен.")
             return
 
         target = await _resolve_mute_target(event, args_clean)
@@ -4437,11 +5229,14 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             await _notify(event, "🔇 Список заглушенных пуст.")
             return
         lines = ["🔇 **Заглушенные:**\n"]
+        mode_titles = {"silent": "тихо", "delete": "удаление", "warn": "варн", "ban": "бан"}
         for r in rows[:50]:
             handle = f"@{r['username']}" if r["username"] else f"id {r['peer_key']}"
             label = r["display_name"] or handle
             reason = f" — {r['reason']}" if r["reason"] else ""
-            lines.append(f"• {label} (`{handle}`){reason}")
+            mode = mode_titles.get(r.get("action") or "silent", "тихо")
+            scope = "чат" if (r.get("scope") or "user") == "chat" else "юзер"
+            lines.append(f"• {label} (`{handle}`, {scope}, {mode}){reason}")
         if len(rows) > 50:
             lines.append(f"\n…и ещё {len(rows) - 50}")
         await _notify(event, "\n".join(lines), auto_delete=25)
@@ -4556,7 +5351,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     "UPDATE chat_rotations SET is_active = 1 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)",
                     (target_name, f"<{target_name}>", my_id),
                 )
-        active_b = getattr(client, "_spambuster_broadcaster", broadcaster)
+        active_b = getattr(client, "_colemailer_broadcaster", None) or getattr(client, "_spambuster_broadcaster", broadcaster)
         try:
             active_b.request_folder_sync()
         except Exception:
@@ -4702,7 +5497,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                             text=tpl_data["text"],
                             entities_hex=tpl_data["entities_hex"],
                             media_files=tpl_data["media_files"],
-                            bundle=tpl_data.get("bundle")
+                            bundle=tpl_data.get("bundle"),
+                            buttons=tpl_data.get("buttons"),
+                            disable_preview=bool(tpl_data.get("disable_preview")),
                         )
                 return
 
@@ -4718,8 +5515,25 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 text=tpl["text"],
                 entities_hex=tpl["entities_hex"],
                 media_files=tpl["media_files"],
-                bundle=tpl.get("bundle")
+                bundle=tpl.get("bundle"),
+                buttons=tpl.get("buttons"),
+                disable_preview=bool(tpl.get("disable_preview")),
             )
+
+# Мост для Android/UI: приложение подставляет свои функции ввода, потому что
+# stdin в APK нет. Формат: callable(prompt: str) -> str.
+CODE_PROVIDER = None
+PASSWORD_PROVIDER = None
+
+
+def _prompt(prompt: str, secret: bool = False) -> str:
+    provider = PASSWORD_PROVIDER if secret else CODE_PROVIDER
+    if provider is not None:
+        return str(provider(prompt) or "")
+    if not sys.stdin.isatty():
+        raise RuntimeError("нужен ввод с клавиатуры, но консоли нет")
+    return getpass.getpass(prompt) if secret else input(prompt)
+
 
 async def authenticate_client(client: TelegramClient, phone_cfg: str, acc_name: str = "default"):
     await client.connect()
@@ -4728,17 +5542,17 @@ async def authenticate_client(client: TelegramClient, phone_cfg: str, acc_name: 
 
     phone = phone_cfg.strip()
     if not phone:
-        phone = input(f"[{acc_name}] Введите номер телефона (с кодом страны, напр. +79991234567): ").strip()
+        phone = _prompt(f"[{acc_name}] Введите номер телефона (с кодом страны, напр. +79991234567): ").strip()
 
     print(f"[{acc_name}] Отправка кода подтверждения на номер {phone}...")
     await client.send_code_request(phone)
-    code = input(f"[{acc_name}] Введите код из Telegram: ").strip()
+    code = _prompt(f"[{acc_name}] Введите код из Telegram: ").strip()
 
     try:
         await client.sign_in(phone=phone, code=code)
     except SessionPasswordNeededError:
         print(f"[{acc_name}] На аккаунте включена двухфакторная аутентификация (2FA).")
-        password = getpass.getpass(f"[{acc_name}] Введите облачный пароль (2FA): ")
+        password = _prompt(f"[{acc_name}] Введите облачный пароль (2FA): ", secret=True)
         await client.sign_in(password=password)
 
 # ---------------------------------------------------------------------------
@@ -4755,7 +5569,7 @@ _INSTANCE_LOCKS: Dict[str, Any] = {}
 
 def _instance_lock_path(key: str) -> Path:
     import tempfile
-    return Path(tempfile.gettempdir()) / f"spambuster_{re.sub(r'[^A-Za-z0-9_]', '_', key)}.lock"
+    return Path(tempfile.gettempdir()) / f"colemailer_{re.sub(r'[^A-Za-z0-9_]', '_', key)}.lock"
 
 
 def acquire_instance_lock(key: str) -> bool:
@@ -4795,7 +5609,7 @@ def release_instance_lock(key: str):
             pass
 
 
-HEALTH_CHECK_SECONDS = 120
+HEALTH_CHECK_SECONDS = 180
 HEALTH_CHECK_TIMEOUT = 25
 
 
@@ -4803,8 +5617,8 @@ async def connection_watchdog(client: TelegramClient, label: str = ""):
     """
     Telegram silently stops pushing updates to a client that looks idle, and
     a socket can die without the library noticing (NAT timeout, Wi-Fi <->
-    mobile switch, laptop sleep). Every couple of minutes make a real request;
-    two failures in a row force a reconnect.
+    mobile switch, laptop sleep). Each 3 minutes make a real request; two
+    failures in a row force a reconnect — but never in the middle of a send.
     """
     from telethon.tl.functions.updates import GetStateRequest
     failures = 0
@@ -4820,6 +5634,11 @@ async def connection_watchdog(client: TelegramClient, label: str = ""):
         except Exception as e:
             failures += 1
             if failures >= 2:
+                broadcaster = getattr(client, "_colemailer_broadcaster", None)
+                if broadcaster is not None and getattr(broadcaster, "_sending_chats", None):
+                    # Не рвать соединение посреди отправки: это даёт дубли.
+                    failures = 1
+                    continue
                 log_error(f"[WATCHDOG]{label} Соединение не отвечает ({type(e).__name__}). Переподключение...")
                 failures = 0
                 try:
@@ -4916,6 +5735,113 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
         broadcaster.stop()
         release_instance_lock(lock_key)
 
+def _write_credentials(api_id: int, api_hash: str, phone: str = ""):
+    """Вписать ключи в config.txt, не ломая остальные настройки и аккаунты."""
+    try:
+        text = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else DEFAULT_CONFIG
+    except Exception:
+        text = DEFAULT_CONFIG
+    lines = text.splitlines()
+    has_sections = any(re.match(r"^\s*\[.+\]\s*$", l) for l in lines)
+
+    if has_sections:
+        # Ключи живут в первой секции аккаунта, а не в глобальной шапке.
+        first = next(i for i, l in enumerate(lines) if re.match(r"^\s*\[.+\]\s*$", l))
+        end = len(lines)
+        for i in range(first + 1, len(lines)):
+            if re.match(r"^\s*\[.+\]\s*$", lines[i]):
+                end = i
+                break
+        section = lines[first + 1:end]
+        tail = lines[end:]
+        seen = {"api_id": False, "api_hash": False, "phone": False}
+        new_section: List[str] = []
+        for line in section:
+            key = line.split("=", 1)[0].strip().lower() if "=" in line else ""
+            if key == "api_id":
+                new_section.append(f"api_id = {api_id}"); seen["api_id"] = True; continue
+            if key == "api_hash":
+                new_section.append(f"api_hash = {api_hash}"); seen["api_hash"] = True; continue
+            if key == "phone" and phone:
+                new_section.append(f"phone = {phone}"); seen["phone"] = True; continue
+            new_section.append(line)
+        added = []
+        if not seen["api_id"]:
+            added.append(f"api_id = {api_id}")
+        if not seen["api_hash"]:
+            added.append(f"api_hash = {api_hash}")
+        if phone and not seen["phone"]:
+            added.append(f"phone = {phone}")
+        new_section[0:0] = added
+        out = lines[:first + 1] + new_section + tail
+        CONFIG_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return
+
+    in_first_section = False
+    seen_id = seen_hash = False
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip().lower() if "=" in stripped else ""
+        if not in_first_section and key == "api_id":
+            out.append(f"api_id = {api_id}"); seen_id = True; continue
+        if not in_first_section and key == "api_hash":
+            out.append(f"api_hash = {api_hash}"); seen_hash = True; continue
+        if not in_first_section and key == "phone" and phone:
+            out.append(f"phone = {phone}"); continue
+        out.append(line)
+    if not seen_id:
+        out.insert(0, f"api_id = {api_id}")
+    if not seen_hash:
+        out.insert(1, f"api_hash = {api_hash}")
+    if phone and not any(l.strip().lower().startswith("phone") for l in out):
+        out.insert(2, f"phone = {phone}")
+    CONFIG_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def auto_api_setup(phone_hint: str = "") -> Optional[Dict[str, object]]:
+    """Диалог авто-получения api_id/api_hash через my.telegram.org."""
+    from cole.api_autoreg import ApiAuthError, MyTelegramAuth
+
+    print("=" * 60)
+    print("Получение api_id и api_hash через my.telegram.org")
+    print("Код придёт в Telegram от официального сервиса (не SMS).")
+    print("=" * 60)
+    phone = (phone_hint or "").strip()
+    if not phone:
+        phone = _prompt("Номер телефона (+79991234567): ").strip()
+    if not phone:
+        print("Номер не указан.")
+        return None
+
+    auth = MyTelegramAuth()
+    try:
+        auth.send_code(phone)
+        code = _prompt("Код из Telegram: ").strip()
+        auth.sign_in(code)
+        app = auth.fetch_app()
+        if app:
+            print("Приложение уже создано на аккаунте — забираю готовые ключи.")
+        else:
+            app = auth.create_app(title="Colemailer", shortname="colemailer")
+            print("Приложение создано.")
+        api_id = int(app["api_id"])
+        api_hash = str(app["api_hash"])
+        _write_credentials(api_id, api_hash, phone)
+        print(f"Готово: api_id={api_id}, api_hash={api_hash[:6]}…")
+        print(f"Записано в {CONFIG_PATH.name}")
+        return {"api_id": api_id, "api_hash": api_hash, "phone": phone}
+    except ApiAuthError as e:
+        print(f"Не получилось: {e}")
+        print("Можно сделать вручную: https://my.telegram.org -> API development tools")
+        return None
+    except (EOFError, KeyboardInterrupt):
+        print("\nОтменено.")
+        return None
+    finally:
+        auth.close()
+
+
 async def main():
     accounts = CONFIG.get("accounts", [])
     if not accounts:
@@ -4934,36 +5860,40 @@ async def main():
 
     if not valid_accounts:
         print("=" * 60)
-        print("[!] Не заполнены api_id и api_hash в config.txt")
-        print("1. Откройте https://my.telegram.org")
-        print("2. Войдите по своему номеру телефона")
-        print("3. Перейдите в 'API development tools'")
-        print("4. Создайте приложение (любое имя) и скопируйте api_id и api_hash в config.txt")
+        print("[!] В config.txt нет api_id и api_hash")
+        print("Можно получить их автоматически — код придёт в Telegram.")
         print("=" * 60)
 
-        raw_id = input("Или введите api_id прямо сейчас: ").strip()
-        raw_hash = input("Введите api_hash прямо сейчас: ").strip()
-        if raw_id.isdigit() and raw_hash:
-            acc = {
-                "name": "default",
-                "api_id": int(raw_id),
-                "api_hash": raw_hash,
-                "phone": "",
-                "session_name": "session_userbot",
-                "auto_sub_folder": "автосабнутое",
-                "auto_read_spam_pings": True,
-                "auto_sub_enabled": True,
-            }
-            valid_accounts = [acc]
-            CONFIG_PATH.write_text(
-                f"api_id = {raw_id}\napi_hash = {raw_hash}\nphone = \nsession_name = session_userbot\nauto_sub_folder = автосабнутое\nauto_read_spam_pings = true\nauto_sub_enabled = true\nlog_errors_only = true\n",
-                encoding="utf-8"
-            )
-        else:
+        if not sys.stdin.isatty():
+            log_error("[ERROR] Ключей нет, а консоли для ввода нет. Заполни api_id/api_hash в config.txt.")
+            return
+
+        answer = input("Получить ключи автоматически через my.telegram.org? [д/н]: ").strip().lower()
+        creds = None
+        if answer in ("", "д", "да", "y", "yes"):
+            creds = auto_api_setup()
+        if not creds:
+            raw_id = input("Или введите api_id прямо сейчас: ").strip()
+            raw_hash = input("Введите api_hash прямо сейчас: ").strip()
+            if raw_id.isdigit() and raw_hash:
+                creds = {"api_id": int(raw_id), "api_hash": raw_hash, "phone": ""}
+                _write_credentials(int(raw_id), raw_hash)
+        if not creds:
             sys.exit(1)
+        acc = {
+            "name": "default",
+            "api_id": creds["api_id"],
+            "api_hash": creds["api_hash"],
+            "phone": creds.get("phone") or "",
+            "session_name": "session_userbot",
+            "auto_sub_folder": "автосабнутое",
+            "auto_read_spam_pings": True,
+            "auto_sub_enabled": True,
+        }
+        valid_accounts = [acc]
 
     print("=" * 55)
-    print("🚀 Запуск Spambuster Telegram Userbot (24/7 Background)")
+    print(f"🚀 {APP_NAME} {APP_VERSION} — юзербот для Telegram (24/7)")
     print(f"📡 Активных аккаунтов в конфигурации: {len(valid_accounts)}")
     print(f"🔇 Режим скрытия спама в логах: {'ВКЛ (только ошибки)' if CONFIG.get('log_errors_only', True) else 'ВЫКЛ (полные логи)'}")
     print("💬 Команды: напишите .инструкция или .help в любом чате")
@@ -4977,6 +5907,34 @@ async def main():
             log_error(f"[FATAL][{acc.get('name')}] {type(res).__name__}: {res}")
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="bot.py", description=f"{APP_NAME} — юзербот для Telegram")
+    parser.add_argument("--auto-api", nargs="?", const="", metavar="PHONE",
+                        help="получить api_id/api_hash через my.telegram.org")
+    parser.add_argument("--version", action="store_true", help="показать версию")
+    parser.add_argument("--check", action="store_true", help="проверить config.txt")
+    args, _unknown = parser.parse_known_args()
+
+    if args.version:
+        print(f"{APP_NAME} {APP_VERSION}")
+        sys.exit(0)
+
+    if args.check:
+        accounts = CONFIG.get("accounts") or []
+        print(f"{APP_NAME} {APP_VERSION}")
+        print(f"config: {CONFIG_PATH}")
+        print(f"база:   {DB_PATH}")
+        print(f"аккаунтов: {len(accounts)}")
+        for a in accounts:
+            ok = "ok" if (a.get("api_id") and a.get("api_hash")) else "нет api_id/api_hash"
+            print(f"  • {a.get('name')}: {a.get('phone') or 'номер не задан'} — {ok}")
+        sys.exit(0 if accounts else 2)
+
+    if args.auto_api is not None:
+        result = auto_api_setup(args.auto_api)
+        sys.exit(0 if result else 2)
+
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):

@@ -1,8 +1,128 @@
 <resources>
-    <string name="app_name">Spambuster</string>
-    <string name="channel_id">spambuster_service_channel</string>
-    <string name="channel_name">Spambuster Background Service</string>
-    <string name="channel_desc">Telegram userbot and antispam 24/7 background worker</string>
-    <string name="service_running_title">Spambuster активен (24/7)</string>
-    <string name="service_running_content">Защита от спама и авто-рассылки работают в фоне</string>
+    <string name="app_name">Colemailer</string>
+    <string name="app_tagline">Юзербот и антиспам 24/7</string>
+
+    <!-- Уведомления -->
+    <string name="channel_service_name">Colemailer 24/7</string>
+    <string name="channel_service_desc">Юзербот и антиспам в фоне</string>
+    <string name="channel_alerts_name">Запросы входа</string>
+    <string name="channel_alerts_desc">Код Telegram и пароль 2FA</string>
+    <string name="notif_service_title">Colemailer</string>
+    <string name="notif_stop">Остановить</string>
+    <string name="notif_code_title">Нужен код Telegram</string>
+    <string name="notif_code_text">Код пришёл в чат «Telegram». Нажмите, чтобы ввести.</string>
+    <string name="notif_password_title">Нужен пароль 2FA</string>
+    <string name="notif_password_text">Введите облачный пароль Telegram.</string>
+
+    <!-- Навигация -->
+    <string name="nav_home">Главная</string>
+    <string name="nav_connect">Подключение</string>
+    <string name="nav_broadcasts">Рассылки</string>
+    <string name="nav_settings">Настройки</string>
+
+    <!-- Состояния -->
+    <string name="state_idle">Остановлен</string>
+    <string name="state_starting">Запуск…</string>
+    <string name="state_connecting">Подключение к Telegram…</string>
+    <string name="state_code_required">Нужен код из Telegram</string>
+    <string name="state_password_required">Нужен пароль 2FA</string>
+    <string name="state_running">Работает</string>
+    <string name="state_degraded">Нет связи, переподключаюсь</string>
+    <string name="state_stopped">Остановлен вручную</string>
+    <string name="state_error">Ошибка</string>
+    <string name="state_uptime_zero">—</string>
+    <string name="detail_running">Бот слушает Telegram и держит расписание рассылок</string>
+    <string name="detail_code">Откройте уведомление «Нужен код Telegram» и введите код</string>
+    <string name="detail_password">Нужен облачный пароль — откройте уведомление</string>
+    <string name="detail_connecting">Ждём подключения к Telegram</string>
+    <string name="detail_idle">Бот выключен</string>
+
+    <!-- Главная -->
+    <string name="btn_start">Запустить 24/7</string>
+    <string name="btn_stop">Остановить</string>
+    <string name="btn_retry">Повторить</string>
+    <string name="btn_enter_code">Ввести код</string>
+    <string name="btn_enter_password">Ввести пароль 2FA</string>
+    <string name="label_account">Аккаунт</string>
+    <string name="label_account_empty">не подключён</string>
+    <string name="label_background">Работа в фоне</string>
+    <string name="label_last_log">Последнее в логе</string>
+    <string name="label_version">Версия</string>
+    <string name="label_next_task">Ближайшая задача</string>
+    <string name="label_no_task">нет активных задач</string>
+    <string name="bg_summary_fmt">Работа в фоне: %1$d из %2$d</string>
+    <string name="btn_fix">Исправить</string>
+
+    <!-- Чек-лист фона -->
+    <string name="check_notifications">Уведомления разрешены</string>
+    <string name="check_battery">Оптимизация батареи отключена</string>
+    <string name="check_background">Фоновая активность не ограничена</string>
+    <string name="check_autostart">Автозапуск включён (отметка вручную)</string>
+    <string name="btn_open_autostart">Открыть экран автозапуска</string>
+    <string name="btn_mark_autostart">Отметить как включённый</string>
+    <string name="btn_app_details">Настройки приложения</string>
+    <string name="state_note_autostart">Без автозапуска сервис не поднимется после перезагрузки и свайпа</string>
+
+    <!-- Подключение -->
+    <string name="connect_title">Подключение</string>
+    <string name="connect_hint">Telegram выдаёт api_id и api_hash для приложения. Их можно получить автоматически: код подтверждения придёт в чат «Telegram».</string>
+    <string name="hint_api_id">api_id (только цифры)</string>
+    <string name="hint_api_hash">api_hash (32 символа)</string>
+    <string name="hint_phone">Телефон (+79991234567)</string>
+    <string name="hint_password2fa">Пароль 2FA (если включён)</string>
+    <string name="btn_auto_api">Получить автоматически</string>
+    <string name="btn_save_keys">Сохранить ключи</string>
+    <string name="connect_auto_hint">Код придёт в Telegram от сервиса, не по SMS. Ключи сохранятся в config.txt на устройстве.</string>
+
+    <!-- Рассылки -->
+    <string name="broadcasts_title">Рассылки</string>
+    <string name="broadcasts_empty">Пока пусто: шаблоны и задачи появятся после первого запуска бота.</string>
+    <string name="broadcasts_not_ready">Бот ещё не запускался — список задач появится после старта.</string>
+    <string name="broadcasts_hint">Управление шаблонами и расписанием — командами в чате с ботом (например .меню). Здесь только просмотр.</string>
+    <string name="btn_refresh">Обновить</string>
+    <string name="item_task_interval">каждые %1$s</string>
+    <string name="item_task_next">следующая: %1$s</string>
+    <string name="item_task_chat">чат %1$s</string>
+
+    <!-- Настройки -->
+    <string name="settings_title">Настройки</string>
+    <string name="settings_antispam">Антиспам: читать пинги</string>
+    <string name="settings_autosub">Авто-подписка в папку</string>
+    <string name="settings_folder">Папка авто-подписки</string>
+    <string name="settings_quiet_logs">Тихие логи (только ошибки)</string>
+    <string name="btn_save_settings">Сохранить настройки</string>
+    <string name="settings_background">Работа в фоне и разрешения</string>
+    <string name="settings_links">Ссылки</string>
+    <string name="btn_manual_api">Как получить api_id вручную</string>
+    <string name="settings_restart_note">Часть настроек применяется после перезапуска бота.</string>
+
+    <!-- Ввод кода -->
+    <string name="auth_title_code">Код из Telegram</string>
+    <string name="auth_title_password">Пароль 2FA</string>
+    <string name="auth_hint_code">Код подтверждения</string>
+    <string name="auth_hint_password">Облачный пароль</string>
+    <string name="auth_btn_ok">Отправить</string>
+    <string name="auth_btn_cancel">Отмена</string>
+    <string name="auth_note">Экран можно закрыть: запрос останется в сервисе, пока бот его не получит.</string>
+    <string name="state_input_cancelled">Вход отменён: данные не введены</string>
+    <string name="auth_unknown">Запрос уже закрыт</string>
+
+    <!-- Логи -->
+    <string name="log_title">Логи</string>
+    <string name="log_empty">Логов пока нет.</string>
+    <string name="btn_copy_log">Скопировать</string>
+    <string name="btn_clear_log">Очистить</string>
+
+    <!-- Тосты и сообщения -->
+    <string name="toast_need_keys">Сначала заполните api_id и api_hash</string>
+    <string name="toast_need_phone">Укажите номер телефона</string>
+    <string name="toast_saved">Сохранено</string>
+    <string name="toast_error_fmt">Ошибка: %1$s</string>
+    <string name="toast_auto_api_started">Запрос кода отправлен, ждём код из Telegram</string>
+    <string name="toast_auto_api_ok">Готово: api_id %1$s</string>
+    <string name="toast_copied">Скопировано</string>
+    <string name="toast_notifications_denied">Уведомления запрещены: уведомление сервиса не покажется</string>
+    <string name="toast_autostart_marked">Отметка сохранена</string>
+    <string name="toast_no_autostart_screen">Экран автозапуска не найден, открыл настройки приложения</string>
+    <string name="toast_link_failed">Не удалось открыть ссылку</string>
 </resources>

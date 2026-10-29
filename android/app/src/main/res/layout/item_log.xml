@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:paddingStart="12dp"
+    android:paddingTop="3dp"
+    android:paddingEnd="12dp"
+    android:paddingBottom="3dp">
+
+    <TextView
+        android:id="@+id/tv_time"
+        style="@style/TextAppearance.Colemailer.Log.Meta"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        tools:text="18:42:01" />
+
+    <TextView
+        android:id="@+id/tv_level"
+        style="@style/TextAppearance.Colemailer.Log.Meta"
+        android:layout_width="46dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="6dp"
+        tools:text="WARN" />
+
+    <TextView
+        android:id="@+id/tv_message"
+        style="@style/TextAppearance.Colemailer.Log"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:textIsSelectable="true"
+        tools:text="[FOLDER] &quot;посты&quot;: +3 / -1, всего 42" />
+</LinearLayout>

@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -36,17 +37,23 @@ from bot import (
     is_internal_bot_message,
 )
 
-TEST_DB_PATH = Path("test_bot.db")
-
 class TestAntispamProject(unittest.TestCase):
+    """Каждый тест получает собственную временную базу.
+
+    Раньше здесь был общий Path("test_bot.db") в CWD: второй pytest открывал
+    тот же файл, а tearDown пытался его удалить и падал с PermissionError; тесты
+    вдобавок видели данные друг друга. Уникальный каталог на тест снимает и
+    гонку, и зависимость от текущего каталога (WAL-файлы живут рядом с базой).
+    """
+
     def setUp(self):
-        if TEST_DB_PATH.exists():
-            TEST_DB_PATH.unlink()
-        self.db = Database(db_path=TEST_DB_PATH)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="cole_unittest_"))
+        self.db_path = self._tmpdir / "bot.db"
+        self.db = Database(db_path=self.db_path)
 
     def tearDown(self):
-        if TEST_DB_PATH.exists():
-            TEST_DB_PATH.unlink()
+        self.db = None
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_database_templates(self):
         self.db.save_template("promo1", "Hello world", ["010203"], ["media/1.jpg"])
@@ -458,7 +465,8 @@ class TestAntispamProject(unittest.TestCase):
         self.assertEqual(next_a2, "t2")
 
     def test_multi_account_config_loading(self):
-        tmp_cfg = Path("test_multi_config.txt")
+        # Конфиг тоже пишем во временный каталог теста, а не в CWD.
+        tmp_cfg = self._tmpdir / "multi_config.txt"
         tmp_cfg.write_text("""
 log_errors_only = true
 
@@ -793,9 +801,14 @@ auto_sub_enabled = false
         ready = self.db.increment_and_check_counter(chat_id)
         self.assertEqual(len(ready), 1)
 
-        # Counter is now reset to 0 in db
+        # После claim счётчик не обнуляется: сброс происходит только после
+        # реальной отправки, иначе падение процесса между claim и send теряет пост.
         tasks = self.db.get_chat_broadcasts(chat_id)
-        self.assertEqual(tasks[0]["current_count"], 0)
+        self.assertGreaterEqual(tasks[0]["current_count"], 5)
+
+        # Успешная отправка сбрасывает счётчик
+        self.db.mark_task_sent(tasks[0]["id"])
+        self.assertEqual(self.db.get_chat_broadcasts(chat_id)[0]["current_count"], 0)
 
         # Suppose send failed (e.g. slowmode or network/VPN drop): restore counter and last_sent_at
         self.db.restore_counter(tasks[0]["id"], 5, last_sent_at=123456.0)
@@ -988,13 +1001,14 @@ auto_sub_enabled = false
 
         # 1st call registers handlers
         register_events(client, broadcaster, my_id=888)
-        self.assertEqual(len(registered), 3)
-        self.assertTrue(getattr(client, "_spambuster_events_registered", False))
-        self.assertIs(client._spambuster_broadcaster, broadcaster)
+        self.assertEqual(len(registered), 4)
+        self.assertIn("folder_update_handler", registered)
+        self.assertTrue(getattr(client, "_colemailer_events_registered", False))
+        self.assertIs(client._colemailer_broadcaster, broadcaster)
 
         # 2nd call does NOT register duplicate handlers
         register_events(client, broadcaster, my_id=888)
-        self.assertEqual(len(registered), 3)
+        self.assertEqual(len(registered), 4)
 
     def test_is_internal_bot_message(self):
         # The exact message the user saw

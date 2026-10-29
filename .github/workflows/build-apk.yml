@@ -4,10 +4,21 @@ on:
   push:
     branches: [ main, master ]
     tags: [ "v*" ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Два пуша подряд на один ref не должны гоняться за один и тот же тег.
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PY_VER: "3.11"
+  PY_SRC: android/app/src/main/python
 
 jobs:
   test:
@@ -18,22 +29,46 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PY_VER }}
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Sync bot.py into the Android python sources
         run: |
-          mkdir -p android/app/src/main/python
-          cp bot.py android/app/src/main/python/bot.py
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Verify the copies are identical
+      # В репозитории android/app/src/main/python/ лежит только bot_bridge.py —
+      # его удалять нельзя. Перезаписываем только генерируемые bot.py и cole/.
+      - name: Prepare Android python sources
         run: |
-          if ! cmp -s bot.py android/app/src/main/python/bot.py; then
-            echo "bot.py and the Android copy diverged"
-            exit 1
-          fi
+          mkdir -p "$PY_SRC"
+          rm -rf "$PY_SRC/cole" "$PY_SRC/bot.py"
+          cp bot.py "$PY_SRC/bot.py"
+          cp -r cole "$PY_SRC/cole"
+          find "$PY_SRC" -name '__pycache__' -prune -exec rm -rf {} +
+          find "$PY_SRC" -name '*.pyc' -delete
+          test -f "$PY_SRC/bot_bridge.py"
+          test -f "$PY_SRC/cole/cacert.pem"
+          test -f "$PY_SRC/cole/api_autoreg.py"
+          ls -la "$PY_SRC" "$PY_SRC/cole"
+
+      - name: Compile the Android python tree
+        run: |
+          python -m py_compile bot.py "$PY_SRC/bot_bridge.py"
+          python -m compileall -q cole
+
+      # Запуск именно из копии: иначе `import bot` подхватит корневой bot.py
+      # и проверит не то, что попадёт в APK.
+      - name: Smoke-import the Android python tree
+        working-directory: android/app/src/main/python
+        run: |
+          python - <<'EOF'
+          import bot
+          import cole.buttons
+          import cole.api_autoreg
+          import cole.version
+          import bot_bridge
+          print("android python tree imports OK:", cole.version.VERSION)
+          EOF
 
       - name: Run test suite
         run: python -m pytest tests -q
@@ -51,64 +86,102 @@ jobs:
           java-version: "17"
           distribution: temurin
 
-      # Chaquopy compiles the bundled Python with a host Python of the same
-      # version. Without this the runner default (3.12+) can break pip.
+      # Chaquopy собирает pip-пакеты хостовым Python той же версии (3.11).
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PY_VER }}
 
-      - name: Sync bot.py to Android python sources
+      - name: Check signing key
         run: |
-          mkdir -p android/app/src/main/python
-          cp bot.py android/app/src/main/python/bot.py
+          if [ ! -f android/app/colemailer.keystore ]; then
+            echo "::error::android/app/colemailer.keystore отсутствует — APK не установится поверх предыдущего"
+            exit 1
+          fi
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Prepare Android python sources
+        run: |
+          mkdir -p "$PY_SRC"
+          rm -rf "$PY_SRC/cole" "$PY_SRC/bot.py"
+          cp bot.py "$PY_SRC/bot.py"
+          cp -r cole "$PY_SRC/cole"
+          find "$PY_SRC" -name '__pycache__' -prune -exec rm -rf {} +
+          find "$PY_SRC" -name '*.pyc' -delete
+          test -f "$PY_SRC/bot_bridge.py"
+          ls -la "$PY_SRC" "$PY_SRC/cole"
+
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.5"
-          cache-disabled: true
+          gradle-version: "8.9"
 
-      - name: Write local.properties with the SDK path
-        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+      - name: SDK path
+        run: echo "sdk.dir=${ANDROID_SDK_ROOT:-$ANDROID_HOME}" > android/local.properties
 
-      - name: Build Android APK
-        working-directory: ./android
-        run: gradle assembleDebug --stacktrace --no-daemon
+      - name: Build signed APK
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle assembleRelease --stacktrace --no-daemon
+
+      - name: Verify signature
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          SIGNER=$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -1)
+          "$SIGNER" verify --print-certs "$APK" | tee certs.txt
+          if [ -n "${{ vars.EXPECTED_CERT_SHA256 }}" ]; then
+            grep -qi "${{ vars.EXPECTED_CERT_SHA256 }}" certs.txt || {
+              echo "::error::подпись APK изменилась — обновления перестанут ставиться"
+              exit 1
+            }
+          fi
 
       - name: Collect APK
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/spambuster.apk
+          VER=$(python -c "from cole.version import VERSION; print(VERSION)")
+          APK=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          cp "$APK" dist/colemailer.apk
+          sha256sum dist/colemailer.apk > dist/colemailer.apk.sha256
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          cat dist/colemailer.apk.sha256
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: spambuster-apk
-          path: dist/spambuster.apk
+          name: colemailer-apk
+          path: dist/*
           retention-days: 30
 
-      - name: Read app version
-        id: ver
-        run: echo "version=$(grep -oP 'versionName \"\K[^\"]+' android/app/build.gradle)" >> "$GITHUB_OUTPUT"
-
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      # Every push to main publishes/updates the release v<versionName> from
-      # android/app/build.gradle, so a new APK appears in Releases without
-      # having to push a tag by hand. Pushing a v* tag still works as before.
-      - name: Publish Release with APK
+      - name: Publish release with APK
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', env.VER) }}
           target_commitish: ${{ github.sha }}
-          name: Spambuster ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          name: Colemailer ${{ env.VER }}
           make_latest: true
           body: |
-            Скачай spambuster.apk и поставь на телефон (поверх старой версии, данные сохранятся).
-            Сборка: ${{ steps.sha.outputs.short }}
-          files: dist/spambuster.apk
+            Версия ${{ env.VER }}. Сборка ${{ github.sha }}.
+
+            **Как поставить**
+
+            1. Скачайте `colemailer.apk` ниже и откройте на телефоне (разрешите установку из этого источника).
+            2. Запустите приложение: вкладка «Подключение» — api_id, api_hash и номер телефона. Если ключей нет, нажмите «Получить автоматически»: код придёт в Telegram от сервиса.
+            3. Дайте уведомления, отключите оптимизацию батареи, включите автозапуск — приложение проведёт по шагам само.
+
+            **Это другой пакет**
+
+            applicationId теперь `com.colemailer.app`. Старый Spambuster (`com.spambuster.app`) надо удалить: поставить новый APK поверх него нельзя, а сессия Telegram, config.txt и база рассылок не переносятся — данные вводятся заново. Дальше обновления `colemailer.apk` ставятся поверх: ключ подписи один и тот же.
+
+            **Что изменилось**
+
+            - фон: тип сервиса `specialUse`, без постоянного wakelock и без «пинка» раз в 10 минут — точный будильник на время ближайшей задачи плюс страховка WorkManager;
+            - вход и пароль 2FA спрашиваются уведомлением: экран можно закрыть, запрос останется в сервисе;
+            - экран «Работа в фоне» с чек-листом и точными экранами автозапуска для MIUI/HyperOS, EMUI/Honor, OneUI, ColorOS/Oppo/Realme/OnePlus, vivo/iQOO, Meizu, Asus, Letv, Transsion;
+            - статус и лог переживают перезапуск приложения;
+            - авто-получение api_id/api_hash через my.telegram.org.
+
+            Контрольная сумма — в файле `colemailer.apk.sha256` рядом с APK.
+          files: |
+            dist/colemailer.apk
+            dist/colemailer.apk.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

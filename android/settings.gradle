@@ -3,6 +3,7 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
+        // артефакты Chaquopy (плагин и рантайм Python) живут только здесь
         maven { url "https://chaquo.com/maven" }
     }
 }
@@ -12,8 +13,9 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven { url "https://chaquo.com/maven" }
     }
 }
 
-rootProject.name = "Spambuster"
+rootProject.name = "Colemailer"
 include ':app'
