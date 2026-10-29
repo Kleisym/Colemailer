@@ -26,9 +26,14 @@ if (versionFile.exists()) {
         appVersion = match.group(1)
     }
 }
+// GITHUB_RUN_NUMBER растёт и давно перевалил за int, поэтому берём остаток:
+// versionCode должен увеличиваться от сборки к сборке, но влезать в int.
 def ciVersionCode = 0
 try {
-    ciVersionCode = (System.getenv("VERSION_CODE") ?: "0").toInteger()
+    long raw = (System.getenv("VERSION_CODE") ?: "0").toLong()
+    if (raw > 0) {
+        ciVersionCode = (int) (raw % 1_000_000L)
+    }
 } catch (Exception ignored) {
     ciVersionCode = 0
 }
