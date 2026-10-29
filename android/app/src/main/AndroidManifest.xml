@@ -68,10 +68,8 @@
              открывался поверх любого приложения из уведомления. -->
         <activity
             android:name=".ui.AuthActivity"
-            android:excludeFromRecents="true"
             android:exported="false"
             android:launchMode="singleTop"
-            android:taskAffinity="com.colemailer.app.auth"
             android:windowSoftInputMode="adjustResize" />
 
         <service

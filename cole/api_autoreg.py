@@ -67,12 +67,37 @@ def _strip_tags(page: str) -> str:
     return re.sub(r"\s+", " ", page).strip()
 
 
-def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
-    """Достать api_id/api_hash со страницы /apps. None, если приложения нет."""
-    text = _strip_tags(page)
+def _attr_value(page: str, field: str, value_re: str) -> Optional[str]:
+    """Значение поля по id/name, в каком бы порядке ни шли атрибуты."""
+    patterns = (
+        rf"""(?:id|name)=["']{field}["'][^>]{{0,300}}?value=["']({value_re})["']""",
+        rf"""value=["']({value_re})["'][^>]{{0,300}}?(?:id|name)=["']{field}["']""",
+        rf"""for=["']{field}["'][^>]*>[\s\S]{{0,260}}?({value_re})""",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, page, re.IGNORECASE | re.DOTALL)
+        if m:
+            return html_module.unescape(m.group(1))
+    return None
 
-    id_match = re.search(r"api[\s_-]?id\D{0,40}?(\d{4,12})", text, re.IGNORECASE)
-    hash_match = re.search(r"api[\s_-]?hash\D{0,40}?([0-9a-f]{32})", text, re.IGNORECASE)
+
+def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
+    """Достать api_id/api_hash со страницы /apps. None, если приложения нет.
+
+    my.telegram.org держит значения то в тексте (`<span><strong>`), то в
+    value="" инпута — поэтому сначала смотрим разметку по id/name, затем
+    текст. Раньше парсер понимал только текст и на реальной странице с
+    существующим приложением возвращал None: бот шёл создавать новое и
+    получал «приложение не создалось».
+    """
+    raw_id = _attr_value(page, "app_id", r"\d{4,12}")
+    raw_hash = _attr_value(page, "app_hash", r"[0-9a-fA-F]{32}")
+    if raw_id and raw_hash:
+        return {"api_id": int(raw_id), "api_hash": raw_hash.lower()}
+
+    text = _strip_tags(page)
+    id_match = re.search(r"api[\s_-]?id\D{0,60}?(\d{4,12})", text, re.IGNORECASE)
+    hash_match = re.search(r"api[\s_-]?hash\D{0,60}?([0-9a-f]{32})", text, re.IGNORECASE)
     if not id_match or not hash_match:
         return None
     return {

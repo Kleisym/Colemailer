@@ -75,6 +75,35 @@ def test_parse_apps_page_normalises_uppercase_hash():
     assert parsed["api_hash"] == "abcdef0123456789abcdef0123456789"
 
 
+def test_parse_apps_page_reads_input_values():
+    """Реальная страница может держать значения в value=, а не в тексте."""
+    page = """
+    <html><body>
+      <label for="app_id">App api_id:</label>
+      <div><span><input id="app_id" value="1234567" readonly></span></div>
+      <label for="app_hash">App api_hash:</label>
+      <div><span><input value="0123456789abcdef0123456789abcdef" name="app_hash" readonly></span></div>
+    </body></html>
+    """
+    assert parse_apps_page(page) == {
+        "api_id": 1234567,
+        "api_hash": "0123456789abcdef0123456789abcdef",
+    }
+
+
+def test_parse_apps_page_reads_label_and_strong():
+    page = """
+    <label for="app_id">App api_id:</label>
+    <div class="input-group"><span class="form-control"><strong>1234567</strong></span></div>
+    <label for="app_hash">App api_hash:</label>
+    <div class="input-group"><span class="form-control">0123456789abcdef0123456789abcdef</span></div>
+    """
+    assert parse_apps_page(page) == {
+        "api_id": 1234567,
+        "api_hash": "0123456789abcdef0123456789abcdef",
+    }
+
+
 def test_parse_apps_page_returns_none_when_the_app_is_not_created_yet():
     assert parse_apps_page(CREATE_FORM_PAGE) is None
 

@@ -134,8 +134,9 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            container.updatePadding(top = bars.top)
-            nav.updatePadding(bottom = bars.bottom)
+            val minTop = (24 * resources.displayMetrics.density).toInt()
+            container.updatePadding(top = maxOf(bars.top, minTop))
+            nav.updatePadding(bottom = maxOf(bars.bottom, (8 * resources.displayMetrics.density).toInt()))
             // Клавиатура не должна закрывать поля ввода на экране «Подключение».
             container.updatePadding(bottom = if (ime.bottom > bars.bottom) ime.bottom else 0)
             insets
