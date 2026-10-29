@@ -22,6 +22,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -81,35 +82,109 @@ def _attr_value(page: str, field: str, value_re: str) -> Optional[str]:
     return None
 
 
+def _server_error(body: str) -> str:
+    """Текст ошибки из JSON-ответа my.telegram.org, если он там есть."""
+    try:
+        data = json.loads(body)
+    except Exception:
+        return ""
+    if isinstance(data, dict) and data.get("error"):
+        return _human_error(str(data["error"]))
+    return ""
+
+
+class _FormParser(HTMLParser):
+    """Собирает формы и их поля. Нужен, чтобы взять hash именно формы
+    создания приложения, а не первой попавшейся (например, формы удаления)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[dict] = []
+        self._current: Optional[dict] = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        values = dict(attrs)
+        if tag == "form":
+            self._current = {
+                "action": values.get("action") or "/apps",
+                "fields": {},
+            }
+            self.forms.append(self._current)
+            return
+        if self._current is None:
+            return
+        if tag in ("input", "textarea", "select") and values.get("name"):
+            self._current["fields"][values["name"]] = values.get("value") or ""
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._current = None
+
+
+def _create_form(page: str) -> Optional[dict]:
+    parser = _FormParser()
+    try:
+        parser.feed(page)
+    except Exception:
+        return None
+    for form in parser.forms:
+        fields = form.get("fields") or {}
+        if "app_title" in fields or "app_shortname" in fields:
+            return form
+    return None
+
+
+def _valid_app(api_id: int, api_hash: str) -> bool:
+    if not 1000 <= api_id <= 2**31 - 1:
+        return False
+    if not re.fullmatch(r"[0-9a-f]{32}", api_hash):
+        return False
+    # Защита от ложного захвата: если id «выдернут» из начала хэша,
+    # это не пара ключей.
+    return not api_hash.startswith(str(api_id))
+
+
 def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
     """Достать api_id/api_hash со страницы /apps. None, если приложения нет.
 
     my.telegram.org держит значения то в тексте (`<span><strong>`), то в
     value="" инпута — поэтому сначала смотрим разметку по id/name, затем
-    текст. Раньше парсер понимал только текст и на реальной странице с
-    существующим приложением возвращал None: бот шёл создавать новое и
-    получал «приложение не создалось».
+    текст и JS/JSON. Пробелы и NBSP внутри значений нормализуются.
     """
-    raw_id = _attr_value(page, "app_id", r"\d{4,12}")
-    raw_hash = _attr_value(page, "app_hash", r"[0-9a-fA-F]{32}")
+    compact = re.sub(r"[\s\u00a0\u200b-]", "", page)
+    raw_id = _attr_value(compact, "app_id", r"\d{4,12}")
+    raw_hash = _attr_value(compact, "app_hash", r"[0-9a-fA-F]{32}")
     if raw_id and raw_hash:
-        return {"api_id": int(raw_id), "api_hash": raw_hash.lower()}
+        api_id = int(raw_id)
+        api_hash = raw_hash.lower()
+        if _valid_app(api_id, api_hash):
+            return {"api_id": api_id, "api_hash": api_hash}
 
-    # Последний шанс: значения в JS/JSON или в нестандартной разметке.
-    loose_id = re.search(r"app[_\"'\s:-]{0,20}id[^0-9]{0,80}(\d{4,12})", page, re.IGNORECASE)
-    loose_hash = re.search(r"app[_\"'\s:-]{0,20}hash[^0-9a-f]{0,80}([0-9a-f]{32})", page, re.IGNORECASE)
-    if loose_id and loose_hash:
-        return {"api_id": int(loose_id.group(1)), "api_hash": loose_hash.group(1).lower()}
+    # JS/JSON: app_id/apiId/appId, app_hash/apiHash/appHash.
+    id_keys = r"(?:api[_-]?id|app[_-]?id|apiId|appId)"
+    hash_keys = r"(?:api[_-]?hash|app[_-]?hash|apiHash|appHash)"
+    js_id = re.search(
+        rf'["\']?{id_keys}["\']?\s*[:=]\s*["\']?(\d{{4,12}})', compact, re.IGNORECASE
+    )
+    js_hash = re.search(
+        rf'["\']?{hash_keys}["\']?\s*[:=]\s*["\']?([0-9a-fA-F]{{32}})', compact, re.IGNORECASE
+    )
+    if js_id and js_hash:
+        api_id = int(js_id.group(1))
+        api_hash = js_hash.group(1).lower()
+        if _valid_app(api_id, api_hash):
+            return {"api_id": api_id, "api_hash": api_hash}
 
-    text = _strip_tags(page)
-    id_match = re.search(r"api[\s_-]?id\D{0,60}?(\d{4,12})", text, re.IGNORECASE)
-    hash_match = re.search(r"api[\s_-]?hash\D{0,60}?([0-9a-f]{32})", text, re.IGNORECASE)
+    text = re.sub(r"[\s\u00a0\u200b-]", "", _strip_tags(page))
+    id_match = re.search(r"api[_-]?id[^0-9]{0,80}?(\d{4,12})", text, re.IGNORECASE)
+    hash_match = re.search(r"api[_-]?hash[^0-9a-f]{0,80}?([0-9a-f]{32})", text, re.IGNORECASE)
     if not id_match or not hash_match:
         return None
-    return {
-        "api_id": int(id_match.group(1)),
-        "api_hash": hash_match.group(1).lower(),
-    }
+    api_id = int(id_match.group(1))
+    api_hash = hash_match.group(1).lower()
+    if not _valid_app(api_id, api_hash):
+        return None
+    return {"api_id": api_id, "api_hash": api_hash}
 
 
 def _form_hash(page: str) -> Optional[str]:
@@ -180,7 +255,7 @@ class MyTelegramAuth:
         self.authorized: bool = False
 
     # ---------------------------------------------------------------- transport
-    def _open(self, url: str, data: Optional[Dict[str, str]] = None) -> str:
+    def _open(self, url: str, data: Optional[Dict[str, str]] = None, ajax: bool = True) -> str:
         body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
         headers = {
             "User-Agent": USER_AGENT,
@@ -191,7 +266,9 @@ class MyTelegramAuth:
         }
         if body is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-            headers["X-Requested-With"] = "XMLHttpRequest"
+            if ajax:
+                headers["X-Requested-With"] = "XMLHttpRequest"
+            headers["Referer"] = f"{SITE}/apps" if url.rstrip("/").endswith("/apps") else f"{SITE}/"
         request = urllib.request.Request(url, data=body, headers=headers)
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
@@ -225,9 +302,9 @@ class MyTelegramAuth:
 
     # ------------------------------------------------------------------- steps
     def has_session(self) -> bool:
-        """Есть ли сохранённая cookie входа my.telegram.org."""
+        """Есть ли сохранённая неистёкшая cookie входа my.telegram.org."""
         try:
-            return any(cookie.name == "stel_token" for cookie in self._jar)
+            return any(cookie.name == "stel_token" and not cookie.is_expired() for cookie in self._jar)
         except Exception:
             return False
 
@@ -235,9 +312,21 @@ class MyTelegramAuth:
         if self._cookie_path is None:
             return
         try:
+            if not list(self._jar):
+                return
             self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
             if hasattr(self._jar, "save"):
                 self._jar.save(ignore_discard=True, ignore_expires=False)
+        except Exception:
+            pass
+
+    def _dump(self, tag: str, body: str) -> None:
+        """Сохранить ответ сайта при разборе ошибки — без него чинить нечем."""
+        if self._cookie_path is None:
+            return
+        try:
+            target = self._cookie_path.with_name(f"tg_{tag}_debug.html")
+            target.write_text(body or "", encoding="utf-8")
         except Exception:
             pass
 
@@ -323,22 +412,34 @@ class MyTelegramAuth:
         existing = parse_apps_page(page)
         if existing:
             return existing
-        form_hash = _form_hash(page)
-        if not form_hash:
-            raise ApiAuthError("не нашёл форму создания приложения, зайди на my.telegram.org вручную")
+        form = _create_form(page)
+        if not form:
+            self._dump("apps_no_form", page)
+            raise ApiAuthError(
+                "не нашёл форму создания приложения, зайди на my.telegram.org вручную"
+            )
 
         clean_short = re.sub(r"[^a-zA-Z0-9_]", "", shortname or "colemailer")[:32] or "colemailer"
-        payload = self._open(
-            f"{SITE}/apps",
-            {
-                "hash": form_hash,
-                "app_title": (title or "Colemailer")[:64],
-                "app_shortname": clean_short,
-                "app_url": url or "",
-                "app_platform": platform or "other",
-                "app_desc": description or "",
-            },
-        )
+        values = {
+            "app_title": (title or "Colemailer")[:64],
+            "app_shortname": clean_short,
+            "app_url": url or "",
+            "app_platform": platform or "other",
+            "app_desc": description or "",
+        }
+        # Отправляем ровно поля этой формы: у Telegram встречается и
+        # app_desc, и app_description. hash берётся из формы создания, а не
+        # из первой попавшейся (например, формы удаления).
+        data = dict(form.get("fields") or {})
+        for name in list(data.keys()):
+            if name in values:
+                data[name] = values[name]
+        if not data.get("hash"):
+            self._dump("apps_no_hash", page)
+            raise ApiAuthError("не нашёл hash формы создания приложения")
+
+        action = urllib.parse.urljoin(SITE, str(form.get("action") or "/apps"))
+        payload = self._open(action, data, ajax=False)
         created = parse_apps_page(payload)
         if created:
             self.save_cookies()
@@ -346,7 +447,12 @@ class MyTelegramAuth:
         again = self.fetch_app()
         if again:
             return again
-        raise ApiAuthError("приложение не создалось, попробуй ещё раз или сделай вручную")
+        self._dump("apps_create", payload)
+        reason = _server_error(payload)
+        if not reason:
+            snippet = _strip_tags(payload)[:180].strip()
+            reason = snippet or "ответ без ключей"
+        raise ApiAuthError("приложение не создалось: %s" % reason)
 
     def close(self) -> None:
         self.save_cookies()

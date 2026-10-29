@@ -104,6 +104,61 @@ def test_parse_apps_page_reads_label_and_strong():
     }
 
 
+def test_parse_apps_page_normalises_spaces_in_hash():
+    page = """
+    <label for="app_id">App api_id:</label><div><strong>1234567</strong></div>
+    <label for="app_hash">App api_hash:</label>
+    <div><span>0123 4567 89ab cdef 0123 4567 89ab cdef</span></div>
+    """
+    assert parse_apps_page(page) == {
+        "api_id": 1234567,
+        "api_hash": "0123456789abcdef0123456789abcdef",
+    }
+
+
+def test_parse_apps_page_reads_camel_case_json():
+    page = '{"apiId": 1234567, "apiHash": "0123456789abcdef0123456789abcdef"}'
+    assert parse_apps_page(page) == {
+        "api_id": 1234567,
+        "api_hash": "0123456789abcdef0123456789abcdef",
+    }
+
+
+def test_parse_apps_page_does_not_steal_api_id_from_hash():
+    page = """
+    <label for="app_id">App api_id:</label><div><span></span></div>
+    <label for="app_hash">App api_hash:</label>
+    <div><span>12345678901234567890123456789012</span></div>
+    """
+    assert parse_apps_page(page) is None
+
+
+def test_create_app_uses_the_create_form_hash_not_a_delete_form():
+    page = """
+    <form method="post" action="/apps/delete">
+      <input type="hidden" name="hash" value="DELETE_TOKEN">
+      <input type="text" name="app_id" value="1">
+    </form>
+    <form method="post" action="/apps">
+      <input type="hidden" name="hash" value="CREATE_TOKEN">
+      <input type="text" name="app_title" value="">
+      <input type="text" name="app_shortname" value="">
+      <textarea name="app_description"></textarea>
+    </form>
+    """
+    opener = FakeOpener(
+        get_pages={"/apps": page},
+        post_pages={"/apps": APPS_PAGE},
+    )
+    auth = make_auth(opener)
+    auth.create_app(title="Colemailer", shortname="colemailer")
+
+    body = [c for c in opener.calls if c[0] == "POST"][0][2]
+    assert b"hash=CREATE_TOKEN" in body
+    assert b"DELETE_TOKEN" not in body
+    assert b"app_description=" in body
+
+
 def test_parse_apps_page_returns_none_when_the_app_is_not_created_yet():
     assert parse_apps_page(CREATE_FORM_PAGE) is None
 
