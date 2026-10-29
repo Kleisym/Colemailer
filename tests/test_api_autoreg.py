@@ -178,6 +178,27 @@ def test_fetch_app_follows_the_active_app_link():
     assert any("app_id=1234567" in call[1] for call in opener.calls)
 
 
+def test_fetch_app_submits_the_app_selection_form():
+    list_page = """
+    <form method="post" action="/apps">
+      <input type="hidden" name="hash" value="SELECT_TOKEN">
+      <input type="hidden" name="app_id" value="1234567">
+      <button>Open</button>
+    </form>
+    """
+    opener = FakeOpener(
+        get_pages={"/apps": list_page},
+        post_pages={"/apps": APPS_PAGE},
+    )
+    auth = make_auth(opener)
+
+    found = auth.fetch_app()
+
+    assert found == {"api_id": 1234567, "api_hash": "0123456789abcdef0123456789abcdef"}
+    post = [c for c in opener.calls if c[0] == "POST"][0]
+    assert b"app_id=1234567" in post[2]
+
+
 def test_parse_apps_page_returns_none_when_the_app_is_not_created_yet():
     assert parse_apps_page(CREATE_FORM_PAGE) is None
 

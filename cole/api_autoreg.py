@@ -163,8 +163,14 @@ def _app_links(page: str) -> list[str]:
             result.append(href)
         elif "active app" in text.lower() or "created" in text.lower():
             result.append(href)
-    # Иногда ссылка собирается JS — ищем app_id в тексте страницы.
-    for match in re.findall(r'href=["\']([^"\']*app_id=[^"\']*)["\']', page, re.IGNORECASE):
+    # Иногда ссылка собирается JS/onclick — ищем app_id в тексте страницы.
+    for match in re.findall(
+        r'(?:href|onclick|data-url|data-href)\s*=\s*["\']([^"\']*app_id=[^"\']*)["\']',
+        page,
+        re.IGNORECASE,
+    ):
+        result.append(html_module.unescape(match))
+    for match in re.findall(r'/apps\?[^"\'\s<>]*app_id=[^"\'\s<>]+', page, re.IGNORECASE):
         result.append(html_module.unescape(match))
     seen: set[str] = set()
     unique: list[str] = []
@@ -184,6 +190,21 @@ def _create_form(page: str) -> Optional[dict]:
     for form in parser.forms:
         fields = form.get("fields") or {}
         if "app_title" in fields or "app_shortname" in fields:
+            return form
+    return None
+
+
+def _app_form(page: str) -> Optional[dict]:
+    """Форма выбора приложения (скрытый app_id), если ссылки нет."""
+    parser = _FormParser()
+    try:
+        parser.feed(page)
+    except Exception:
+        return None
+    for form in parser.forms:
+        fields = form.get("fields") or {}
+        action = str(form.get("action") or "").lower()
+        if "app_id" in fields and "app_title" not in fields and "delete" not in action:
             return form
     return None
 
@@ -461,6 +482,18 @@ class MyTelegramAuth:
             if found:
                 self.save_cookies()
                 return found
+
+        form = _app_form(page)
+        if form:
+            try:
+                action = urllib.parse.urljoin(SITE, str(form.get("action") or "/apps"))
+                detail = self._open(action, dict(form.get("fields") or {}), ajax=False)
+                found = parse_apps_page(detail)
+                if found:
+                    self.save_cookies()
+                    return found
+            except Exception:
+                pass
         return None
 
     def fetch_app(self) -> Optional[Dict[str, object]]:
