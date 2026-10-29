@@ -66,6 +66,7 @@
     <string name="btn_app_details">Настройки приложения</string>
     <string name="btn_root_grants">Выдать всё через root</string>
     <string name="btn_shizuku_grants">Выдать всё через Shizuku</string>
+    <string name="btn_code_access">Брать код из уведомлений Telegram</string>
     <string name="toast_shizuku_checking">Проверяю Shizuku…</string>
     <string name="toast_shizuku_missing">Shizuku не запущен. Установи и запусти Shizuku, потом повтори.</string>
     <string name="toast_shizuku_ok">Готово: права выданы через Shizuku</string>

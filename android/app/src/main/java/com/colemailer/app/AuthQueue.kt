@@ -131,6 +131,8 @@ object AuthQueue {
 
     fun hasPending(): Boolean = pendingKind() != null
 
+    fun hasPending(kind: Kind): Boolean = synchronized(lock) { queue.any { it.kind == kind } }
+
     private fun phaseOf(kind: Kind): Phase =
         if (kind == Kind.CODE) Phase.CODE_REQUIRED else Phase.PASSWORD_REQUIRED
 

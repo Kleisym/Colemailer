@@ -28,6 +28,7 @@ class PermissionFlow(private val activity: AppCompatActivity) {
     private var askedExact = false
     private var askedDetails = false
     private var askedAutostart = false
+    private var askedCodeAccess = false
 
     private val notificationLauncher = activity.registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -57,6 +58,10 @@ class PermissionFlow(private val activity: AppCompatActivity) {
         OemAutostart.confirm()
         requestNext()
     }
+
+    private val codeAccessLauncher = activity.registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { requestNext() }
 
     /** Первый запуск: сразу ведём по шагам, не дожидаясь нажатия «Старт». */
     fun startOnFirstLaunch() {
@@ -110,6 +115,10 @@ class PermissionFlow(private val activity: AppCompatActivity) {
             openAppDetails()
             return
         }
+        if (!TelegramCodeListener.isEnabled(activity) && !askedCodeAccess) {
+            askedCodeAccess = true
+            if (launchForResult(codeAccessLauncher, TelegramCodeListener.requestIntent())) return
+        }
         if (!OemAutostart.assumeEnabled() && !askedAutostart) {
             askedAutostart = true
             openAutostart()
@@ -153,6 +162,7 @@ class PermissionFlow(private val activity: AppCompatActivity) {
         askedExact = false
         askedDetails = false
         askedAutostart = false
+        askedCodeAccess = false
     }
 
     private fun launchForResult(

@@ -318,7 +318,7 @@ python bot.py --check
 ```
 
 ```text
-Colemailer 3.4.6
+Colemailer 3.4.7
 config: /home/user/Colemailer/config.txt
 база:   /home/user/Colemailer/storage/bot.db
 аккаунтов: 2
@@ -592,6 +592,11 @@ GitHub Actions гоняет одно и то же на **Ubuntu, Windows и macO
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE). Пользуйся, меняй, распространяй.
+
+## Changelog 3.4.7
+
+- **Код из уведомления Telegram подставляется сам.** Сервис слушает уведомления только пакетов Telegram и только когда приложение ждёт код my.telegram.org; код отправляется в AuthQueue автоматически. Один раз нужно включить «Доступ к уведомлениям» — приложение открывает этот экран само при первом запуске, кнопка также есть в настройках.
+- Версия 3.4.7.
 
 ## Changelog 3.4.6
 

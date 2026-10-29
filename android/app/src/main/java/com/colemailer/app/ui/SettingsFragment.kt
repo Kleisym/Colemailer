@@ -19,6 +19,7 @@ import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
 import com.colemailer.app.RootShell
 import com.colemailer.app.ShizukuShell
+import com.colemailer.app.TelegramCodeListener
 import com.colemailer.app.UpdateManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -94,6 +95,9 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
         }
         view.findViewById<MaterialButton>(R.id.btn_root_grants).setOnClickListener { grantViaRoot() }
         view.findViewById<MaterialButton>(R.id.btn_shizuku_grants).setOnClickListener { grantViaShizuku() }
+        view.findViewById<MaterialButton>(R.id.btn_code_access).setOnClickListener {
+            runCatching { startActivity(TelegramCodeListener.requestIntent()) }
+        }
         runCatching { Shizuku.addRequestPermissionResultListener(shizukuPermissionListener) }
         view.findViewById<MaterialButton>(R.id.btn_open_autostart).setOnClickListener {
             (activity as? MainActivity)?.permissionFlow?.openAutostart()
