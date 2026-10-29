@@ -16,6 +16,8 @@ object RootShell {
 
     data class Result(val available: Boolean, val ok: Boolean, val log: String)
 
+    data class InstallResult(val ok: Boolean, val output: String)
+
     private data class CmdResult(val exit: Int, val output: String)
 
     fun isAvailable(): Boolean {
@@ -77,5 +79,15 @@ object RootShell {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /** Тихая установка обновления через su. */
+    fun installApk(file: java.io.File): InstallResult {
+        val path = file.absolutePath.replace("'", "'\\''")
+        val command = "pm install -r '$path'"
+        val result = exec(command, timeoutSeconds = 120)
+            ?: return InstallResult(false, "su недоступен")
+        val ok = result.exit == 0 && result.output.contains("Success", ignoreCase = true)
+        return InstallResult(ok, result.output)
     }
 }

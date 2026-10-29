@@ -10,10 +10,13 @@ import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.colemailer.app.BatteryOpt
 import com.colemailer.app.OemAutostart
+import com.colemailer.app.Prefs
 import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
 import com.colemailer.app.RootShell
+import com.colemailer.app.UpdateManager
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.google.android.material.textfield.TextInputEditText
 import kotlinx.coroutines.Dispatchers
@@ -35,6 +38,8 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
     private lateinit var etFolder: TextInputEditText
     private lateinit var tvBgReport: TextView
     private lateinit var tvVersion: TextView
+    private lateinit var switchAutoUpdate: SwitchMaterial
+    private lateinit var tvUpdateStatus: TextView
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -45,8 +50,14 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
         etFolder = view.findViewById(R.id.et_folder)
         tvBgReport = view.findViewById(R.id.tv_bg_report)
         tvVersion = view.findViewById(R.id.tv_version)
+        switchAutoUpdate = view.findViewById(R.id.switch_auto_update)
+        tvUpdateStatus = view.findViewById(R.id.tv_update_status)
 
         tvVersion.text = appVersion()
+        switchAutoUpdate.isChecked = Prefs.autoUpdate
+        switchAutoUpdate.setOnCheckedChangeListener { _, checked -> Prefs.autoUpdate = checked }
+        tvUpdateStatus.text = getString(R.string.update_current, appVersion())
+        view.findViewById<MaterialButton>(R.id.btn_check_update).setOnClickListener { checkForUpdate() }
 
         view.findViewById<MaterialButton>(R.id.btn_save_settings).setOnClickListener { saveSettings() }
         view.findViewById<MaterialButton>(R.id.btn_fix_all).setOnClickListener {
@@ -134,6 +145,49 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
             append(OemAutostart.manualSteps())
         }
         tvBgReport.text = text.trim()
+    }
+
+    private fun checkForUpdate() {
+        val context = requireContext().applicationContext
+        tvUpdateStatus.text = getString(R.string.update_downloading)
+        viewLifecycleOwner.lifecycleScope.launch {
+            val info = withContext(Dispatchers.IO) { UpdateManager.fetchLatest() }
+            if (info == null) {
+                tvUpdateStatus.text = getString(R.string.update_check_failed)
+                return@launch
+            }
+            val current = UpdateManager.currentVersion(requireContext())
+            if (!UpdateManager.isNewer(info.version, current)) {
+                tvUpdateStatus.text = getString(R.string.update_latest)
+                return@launch
+            }
+            tvUpdateStatus.text = getString(R.string.update_available, info.version)
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(getString(R.string.update_dialog_title, info.version))
+                .setMessage(R.string.update_dialog_text)
+                .setPositiveButton(R.string.update_dialog_download) { _, _ -> downloadAndInstall(info) }
+                .setNegativeButton(R.string.update_dialog_later, null)
+                .show()
+        }
+    }
+
+    private fun downloadAndInstall(info: UpdateManager.Info) {
+        val context = requireContext().applicationContext
+        tvUpdateStatus.text = getString(R.string.update_downloading)
+        viewLifecycleOwner.lifecycleScope.launch {
+            val file = withContext(Dispatchers.IO) { UpdateManager.download(context, info) }
+            if (file == null) {
+                tvUpdateStatus.text = getString(R.string.update_download_failed)
+                return@launch
+            }
+            val result = withContext(Dispatchers.IO) { UpdateManager.install(context, file) }
+            tvUpdateStatus.text = when (result) {
+                "root" -> getString(R.string.update_installed_root)
+                "prompt" -> getString(R.string.update_installer_opened)
+                "permission" -> getString(R.string.update_need_install_permission)
+                else -> getString(R.string.toast_error_fmt, result)
+            }
+        }
     }
 
     /**

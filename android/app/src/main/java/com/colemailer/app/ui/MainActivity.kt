@@ -2,6 +2,7 @@ package com.colemailer.app.ui
 
 import android.os.Bundle
 import android.view.View
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -9,9 +10,17 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import com.colemailer.app.Notifications
 import com.colemailer.app.PermissionFlow
+import com.colemailer.app.Prefs
 import com.colemailer.app.R
+import com.colemailer.app.RootShell
+import com.colemailer.app.UpdateManager
 import com.google.android.material.bottomnavigation.BottomNavigationView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Хост: нижняя навигация + один фрагмент-экран.
@@ -72,6 +81,46 @@ class MainActivity : AppCompatActivity() {
             ?: R.id.nav_home
 
         permissionFlow.startOnFirstLaunch()
+        autoCheckUpdates()
+    }
+
+    /**
+     * Автообновление: раз в 6 часов проверяем GitHub Releases. На root
+     * скачиваем и ставим молча; без root показываем уведомление, установку
+     * подтверждает пользователь (ограничение Android).
+     */
+    private fun autoCheckUpdates() {
+        if (!Prefs.autoUpdate) return
+        val now = System.currentTimeMillis()
+        if (now - Prefs.lastUpdateCheck < 6 * 60 * 60 * 1000L) return
+        Prefs.lastUpdateCheck = now
+        lifecycleScope.launch {
+            val info = withContext(Dispatchers.IO) { UpdateManager.fetchLatest() } ?: return@launch
+            val current = UpdateManager.currentVersion(applicationContext)
+            if (!UpdateManager.isNewer(info.version, current)) return@launch
+            val rooted = withContext(Dispatchers.IO) { RootShell.isAvailable() }
+            if (!rooted) {
+                Notifications.updateAvailable(applicationContext, info.version)
+                return@launch
+            }
+            Toast.makeText(
+                this@MainActivity,
+                getString(R.string.update_downloading),
+                Toast.LENGTH_SHORT
+            ).show()
+            val file = withContext(Dispatchers.IO) { UpdateManager.download(applicationContext, info) }
+            if (file == null) {
+                Notifications.updateAvailable(applicationContext, info.version)
+                return@launch
+            }
+            val result = withContext(Dispatchers.IO) { UpdateManager.install(applicationContext, file) }
+            val text = if (result == "root") {
+                getString(R.string.update_installed_root)
+            } else {
+                getString(R.string.update_installer_opened)
+            }
+            Toast.makeText(this@MainActivity, text, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun applyWindowInsets() {

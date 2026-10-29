@@ -25,6 +25,7 @@ object Notifications {
 
     const val ID_FOREGROUND = 1001
     const val ID_AUTH = 1002
+    const val ID_UPDATE = 1003
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -80,6 +81,22 @@ object Notifications {
         runCatching {
             NotificationManagerCompat.from(context)
                 .notify(ID_FOREGROUND, foreground(context, state))
+        }
+    }
+
+    /** Доступно обновление: тап открывает приложение (Настройки → Обновление). */
+    fun updateAvailable(context: Context, version: String) {
+        if (!granted(context)) return
+        val notification = NotificationCompat.Builder(context, CHANNEL_ALERTS)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(context.getString(R.string.update_available, version))
+            .setContentText(context.getString(R.string.update_notification_text))
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setContentIntent(openApp(context))
+            .build()
+        runCatching {
+            NotificationManagerCompat.from(context).notify(ID_UPDATE, notification)
         }
     }
 

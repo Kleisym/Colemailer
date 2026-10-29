@@ -100,6 +100,22 @@
     <string name="settings_background">Работа в фоне и разрешения</string>
     <string name="settings_links">Ссылки</string>
     <string name="btn_manual_api">Как получить api_id вручную</string>
+    <string name="settings_auto_update">Автообновление (на root — тихо)</string>
+    <string name="btn_check_update">Проверить обновление</string>
+    <string name="update_current">Установлена версия %1$s</string>
+    <string name="update_available">Доступна версия %1$s</string>
+    <string name="update_latest">Установлена последняя версия</string>
+    <string name="update_check_failed">Не удалось проверить обновление</string>
+    <string name="update_downloading">Скачиваю обновление…</string>
+    <string name="update_download_failed">Не удалось скачать APK</string>
+    <string name="update_installed_root">Обновление установлено через root. Перезапустите приложение.</string>
+    <string name="update_installer_opened">Открыт установщик Android — подтвердите установку</string>
+    <string name="update_need_install_permission">Разрешите установку из этого источника и нажмите ещё раз</string>
+    <string name="update_dialog_title">Обновление %1$s</string>
+    <string name="update_dialog_text">Скачать и установить новую версию? Данные и вход сохранятся.</string>
+    <string name="update_dialog_download">Скачать</string>
+    <string name="update_dialog_later">Позже</string>
+    <string name="update_notification_text">Откройте Colemailer → Настройки → Проверить обновление</string>
     <string name="settings_restart_note">Часть настроек применяется после перезапуска бота.</string>
 
     <!-- Ввод кода -->

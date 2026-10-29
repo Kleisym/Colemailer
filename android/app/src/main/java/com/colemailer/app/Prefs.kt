@@ -55,6 +55,15 @@ object Prefs {
         get() = sp.getBoolean("onboarding_done", false)
         set(value) = sp.edit().putBoolean("onboarding_done", value).apply()
 
+    /** Автообновление: проверка релизов GitHub, на root — тихая установка. */
+    var autoUpdate: Boolean
+        get() = sp.getBoolean("auto_update", true)
+        set(value) = sp.edit().putBoolean("auto_update", value).apply()
+
+    var lastUpdateCheck: Long
+        get() = sp.getLong("last_update_check", 0L)
+        set(value) = sp.edit().putLong("last_update_check", value).apply()
+
     // --- секреты (Android Keystore) ---------------------------------------
     var apiId: String
         get() = SecretStore.get("api_id", "") ?: ""
