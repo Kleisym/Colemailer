@@ -124,3 +124,12 @@ def test_default_config_file_is_created_in_temp(tmp_path):
     # Файла нет и это не CONFIG_PATH по умолчанию: пустой конфиг без падения.
     assert loaded["accounts"] == []
     assert not target.exists()
+
+
+def test_help_fits_telegram_message_limit():
+    chunks = bot._split_for_telegram(bot.HELP_TEXT)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= 3800
+    # Ни одна строка не потерялась и не разорвалась.
+    assert sum(len(c.splitlines()) for c in chunks) == len(bot.HELP_TEXT.splitlines())
