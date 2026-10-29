@@ -214,6 +214,7 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
     }
 
     private fun installPending() {
+        if (!isAdded) return
         val info = pendingInfo ?: return
         val context = requireContext().applicationContext
         val file = pendingFile ?: UpdateManager.cachedFile(context, info) ?: return
