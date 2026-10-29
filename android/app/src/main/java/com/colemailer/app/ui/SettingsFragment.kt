@@ -2,10 +2,13 @@ package com.colemailer.app.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import com.colemailer.app.BatteryOpt
@@ -40,6 +43,17 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
     private lateinit var tvVersion: TextView
     private lateinit var switchAutoUpdate: SwitchMaterial
     private lateinit var tvUpdateStatus: TextView
+    private var pendingInfo: UpdateManager.Info? = null
+    private var pendingFile: java.io.File? = null
+    private var askedInstallPermission = false
+
+    private val installPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        // Вернулись из «Разрешить установку из этого источника» — ставим уже
+        // скачанный файл, не проверяя релиз и не качая его заново.
+        installPending()
+    }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -148,6 +162,11 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
     }
 
     private fun checkForUpdate() {
+        // Если файл уже скачан и ждёт разрешения — не проверяем релиз заново.
+        if (pendingFile != null) {
+            installPending()
+            return
+        }
         val context = requireContext().applicationContext
         tvUpdateStatus.text = getString(R.string.update_downloading)
         viewLifecycleOwner.lifecycleScope.launch {
@@ -161,7 +180,14 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
                 tvUpdateStatus.text = getString(R.string.update_latest)
                 return@launch
             }
+            pendingInfo = info
+            val cached = UpdateManager.cachedFile(context, info)
             tvUpdateStatus.text = getString(R.string.update_available, info.version)
+            if (cached != null) {
+                pendingFile = cached
+                installPending()
+                return@launch
+            }
             MaterialAlertDialogBuilder(requireContext())
                 .setTitle(getString(R.string.update_dialog_title, info.version))
                 .setMessage(R.string.update_dialog_text)
@@ -173,19 +199,53 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
 
     private fun downloadAndInstall(info: UpdateManager.Info) {
         val context = requireContext().applicationContext
+        pendingInfo = info
         tvUpdateStatus.text = getString(R.string.update_downloading)
         viewLifecycleOwner.lifecycleScope.launch {
             val file = withContext(Dispatchers.IO) { UpdateManager.download(context, info) }
             if (file == null) {
+                pendingInfo = null
                 tvUpdateStatus.text = getString(R.string.update_download_failed)
                 return@launch
             }
+            pendingFile = file
+            installPending()
+        }
+    }
+
+    private fun installPending() {
+        val info = pendingInfo ?: return
+        val context = requireContext().applicationContext
+        val file = pendingFile ?: UpdateManager.cachedFile(context, info) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !requireContext().packageManager.canRequestPackageInstalls()
+        ) {
+            if (!askedInstallPermission) {
+                askedInstallPermission = true
+                runCatching {
+                    installPermissionLauncher.launch(
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                            .setData(Uri.parse("package:" + context.packageName))
+                    )
+                }
+                tvUpdateStatus.text = getString(R.string.update_need_install_permission)
+            } else {
+                tvUpdateStatus.text = getString(R.string.update_need_install_permission)
+            }
+            return
+        }
+        viewLifecycleOwner.lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { UpdateManager.install(context, file) }
             tvUpdateStatus.text = when (result) {
                 "root" -> getString(R.string.update_installed_root)
                 "prompt" -> getString(R.string.update_installer_opened)
                 "permission" -> getString(R.string.update_need_install_permission)
                 else -> getString(R.string.toast_error_fmt, result)
+            }
+            if (result == "root" || result == "prompt") {
+                pendingInfo = null
+                pendingFile = null
+                askedInstallPermission = false
             }
         }
     }

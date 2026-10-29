@@ -15,6 +15,9 @@ class ColemailerApp : Application() {
         super.onCreate()
         App.init(this)
         Prefs.init(this)
+        // Первый аккаунт создаётся сразу при старте приложения, а не после
+        // захода на вкладку «Подключение».
+        AccountStore.load(this)
         Notifications.ensureChannels(this)
         StatusStore.restore()
         WorkScheduler.ensureGuard(this)

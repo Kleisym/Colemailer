@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import org.json.JSONObject
@@ -22,7 +24,6 @@ import java.net.URL
 object UpdateManager {
 
     private const val API_URL = "https://api.github.com/repos/Kleisym/Colemailer/releases/latest"
-    private const val APK_NAME = "colemailer-update.apk"
 
     data class Info(val version: String, val apkUrl: String, val pageUrl: String)
 
@@ -77,12 +78,15 @@ object UpdateManager {
         return false
     }
 
-    /** Скачать APK в cache/updates. Возвращает файл или null. */
+    /** Скачать APK в cache/updates. Уже скачанный файл этой версии переиспользуется. */
     fun download(context: Context, info: Info): File? {
+        val dir = File(context.cacheDir, "updates").apply { mkdirs() }
+        val target = File(dir, "colemailer-${info.version}.apk")
+        if (target.exists() && target.length() > 1_000_000L) {
+            return target
+        }
         var connection: HttpURLConnection? = null
         return try {
-            val dir = File(context.cacheDir, "updates").apply { mkdirs() }
-            val target = File(dir, APK_NAME)
             connection = (URL(info.apkUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 20000
                 readTimeout = 60000
@@ -105,6 +109,12 @@ object UpdateManager {
         }
     }
 
+    /** Уже скачанный файл этой версии, если он целый. */
+    fun cachedFile(context: Context, info: Info): File? {
+        val file = File(context.cacheDir, "updates/colemailer-${info.version}.apk")
+        return if (file.exists() && file.length() > 1_000_000L) file else null
+    }
+
     /**
      * Установить скачанный APK.
      * @return "root" — установлено молча, "prompt" — открыт установщик,
@@ -119,12 +129,14 @@ object UpdateManager {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !context.packageManager.canRequestPackageInstalls()
         ) {
-            runCatching {
-                context.startActivity(
-                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-                        .setData(Uri.parse("package:" + context.packageName))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
+            Handler(Looper.getMainLooper()).post {
+                runCatching {
+                    context.startActivity(
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                            .setData(Uri.parse("package:" + context.packageName))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
             }
             return "permission"
         }
@@ -133,7 +145,7 @@ object UpdateManager {
             .setDataAndType(uri, "application/vnd.android.package-archive")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         return try {
-            context.startActivity(intent)
+            Handler(Looper.getMainLooper()).post { runCatching { context.startActivity(intent) } }
             "prompt"
         } catch (e: Exception) {
             "нет установщика APK: " + (e.message ?: e.javaClass.simpleName)

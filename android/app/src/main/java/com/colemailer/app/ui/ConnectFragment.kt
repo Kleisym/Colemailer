@@ -1,6 +1,8 @@
 package com.colemailer.app.ui
 
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -86,11 +88,36 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         view.findViewById<MaterialButton>(R.id.btn_delete_account).setOnClickListener { deleteAccount() }
         btnSave.setOnClickListener { saveKeys() }
         btnAuto.setOnClickListener { autoApi() }
+        setupWatchers()
+    }
+
+    /**
+     * Сохраняем поля сразу при вводе, а не только по onPause. Иначе при
+     * переключении вкладок/уходе из приложения последние символы (номер,
+     * api_hash) терялись, если onPause не успевал сработать.
+     */
+    private fun setupWatchers() {
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                if (!filling) saveCurrent()
+            }
+        }
+        etApiId.addTextChangedListener(watcher)
+        etApiHash.addTextChangedListener(watcher)
+        etPhone.addTextChangedListener(watcher)
+        etPassword.addTextChangedListener(watcher)
     }
 
     override fun onPause() {
         saveCurrent()
         super.onPause()
+    }
+
+    override fun onStop() {
+        saveCurrent()
+        super.onStop()
     }
 
     private fun refreshSpinner() {
@@ -131,6 +158,12 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         val apiHash = etApiHash.text?.toString()?.trim().orEmpty()
         val phone = etPhone.text?.toString()?.trim().orEmpty()
         val password = etPassword.text?.toString()?.trim().orEmpty()
+        // Сначала Prefs: даже если файл аккаунтов почему-то не запишется,
+        // номер и ключи не пропадут при переключении вкладки.
+        Prefs.apiId = apiId
+        Prefs.apiHash = apiHash
+        Prefs.phone = phone
+        Prefs.password2fa = password
         val index = accounts.indexOfFirst { it.id == currentId }
         if (index >= 0) {
             accounts[index] = accounts[index].copy(

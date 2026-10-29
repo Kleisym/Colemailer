@@ -67,20 +67,20 @@ object AccountStore {
 
     private fun ensure(context: Context, list: MutableList<Account>): MutableList<Account> {
         if (list.isEmpty()) {
-            val has = Prefs.apiId.isNotBlank() || Prefs.phone.isNotBlank()
-            if (has) {
-                list.add(
-                    Account(
-                        id = UUID.randomUUID().toString(),
-                        name = "Основной",
-                        apiId = Prefs.apiId,
-                        apiHash = Prefs.apiHash,
-                        phone = Prefs.phone,
-                        password = Prefs.password2fa
-                    )
-                )
-                save(context, list)
-            }
+            // Первый запуск: аккаунт №1 создаётся сразу, даже с пустыми
+            // полями. Иначе форма выглядит как «аккаунта нет», а введённые
+            // данные некуда сохранять.
+            val account = Account(
+                id = UUID.randomUUID().toString(),
+                name = "Аккаунт 1",
+                apiId = Prefs.apiId,
+                apiHash = Prefs.apiHash,
+                phone = Prefs.phone,
+                password = Prefs.password2fa
+            )
+            list.add(account)
+            Prefs.activeAccountId = account.id
+            save(context, list)
         }
         return list
     }
