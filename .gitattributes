@@ -1,0 +1,13 @@
+# Единые окончания строк на всех ОС: .sh не должен приезжать на Linux с CRLF,
+# а .bat/.vbs не должны ломаться на Windows.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+
+*.keystore binary
+*.apk binary
+*.pem text eol=lf

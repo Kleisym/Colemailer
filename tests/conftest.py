@@ -32,6 +32,7 @@ def tmp_db(monkeypatch):
         ("_MUTE_CHAT_CACHE", {}),
         ("_MUTE_ACTION_CACHE", {}),
         ("_MUTE_ACTION_CHAT_CACHE", {}),
+        ("_MUTE_USER_CHAT_CACHE", {}),
         ("_MUTE_WARN_COOLDOWN", {}),
         ("_GENUINE_PINGS", {}),
         ("_PRESERVED_PINGS", set()),

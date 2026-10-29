@@ -127,7 +127,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"accounts": [], "log_errors_only": True}
 
     try:
-        content = target_path.read_text(encoding="utf-8")
+        content = target_path.read_text(encoding="utf-8-sig")
     except Exception:
         return {"accounts": [], "log_errors_only": True}
     lines = content.splitlines()
@@ -438,6 +438,7 @@ class Database:
                     display_name TEXT,
                     scope TEXT DEFAULT 'user',
                     action TEXT DEFAULT 'silent',
+                    chat_id INTEGER DEFAULT 0,
                     reason TEXT DEFAULT '',
                     created_at REAL
                 )
@@ -447,6 +448,18 @@ class Database:
                 cols = [r["name"] for r in cursor.fetchall()]
                 if "action" not in cols:
                     cursor.execute("ALTER TABLE muted_peers ADD COLUMN action TEXT DEFAULT 'silent'")
+                if "chat_id" not in cols:
+                    cursor.execute("ALTER TABLE muted_peers ADD COLUMN chat_id INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            # Один и тот же человек может быть заглушён глобально и отдельно
+            # в одном чате: уникальность теперь учитывает chat_id.
+            try:
+                cursor.execute("DROP INDEX IF EXISTS idx_muted_peers_unique")
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_muted_peers_unique "
+                    "ON muted_peers (account_id, peer_key, scope, chat_id)"
+                )
             except Exception:
                 pass
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_muted_peers_lookup ON muted_peers (account_id, peer_key);")
@@ -960,7 +973,7 @@ class Database:
             cur = conn.execute(
                 "UPDATE broadcast_tasks SET send_pending = 1, last_attempt_at = ? "
                 "WHERE id = ? AND is_active = 1 AND COALESCE(send_pending, 0) = 0 "
-                "AND current_count >= counter_threshold",
+                "AND current_count >= MAX(counter_threshold, 1)",
                 (now, task_id),
             )
             return cur.rowcount == 1
@@ -1638,8 +1651,12 @@ class Database:
         scope: str = "user",
         reason: str = "",
         action: str = "silent",
+        chat_id: int = 0,
     ) -> bool:
-        """Add a peer to the mute list. Returns True when newly added."""
+        """Add a peer to the mute list. Returns True when newly added.
+
+        chat_id = 0 — глушить человека везде, иначе только в этом чате.
+        """
         if peer_key is None:
             peer_key = peer_id
         clean_username = (username or "").lstrip("@").strip().lower()
@@ -1647,33 +1664,53 @@ class Database:
         clean_action = (action or "silent").strip().lower()
         if clean_action not in MUTE_ACTIONS:
             clean_action = "silent"
+        mute_chat = int(chat_id or 0) if scope != "chat" else int(chat_id or peer_key)
         with self._conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO muted_peers
-                    (account_id, peer_id, peer_key, username, display_name, scope, action, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (account_id, peer_id, peer_key, username, display_name, scope, action, chat_id, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (account_id, peer_id, peer_key, clean_username, clean_name, scope, clean_action, reason, time.time())
+                (account_id, peer_id, peer_key, clean_username, clean_name, scope,
+                 clean_action, mute_chat, reason, time.time())
             )
             if cursor.rowcount == 0:
                 cursor.execute(
                     "UPDATE muted_peers SET username = COALESCE(NULLIF(?, ''), username), "
-                    "display_name = COALESCE(NULLIF(?, ''), display_name), scope = ?, action = ? "
-                    "WHERE account_id = ? AND peer_key = ?",
-                    (clean_username, clean_name, scope, clean_action, account_id, peer_key)
+                    "display_name = COALESCE(NULLIF(?, ''), display_name), scope = ?, action = ?, chat_id = ? "
+                    "WHERE account_id = ? AND peer_key = ? AND scope = ? AND chat_id = ?",
+                    (clean_username, clean_name, scope, clean_action, mute_chat,
+                     account_id, peer_key, scope, mute_chat)
                 )
                 return False
             return True
 
-    def remove_muted_peer(self, peer_id: int, account_id: int = 0, scope: str = "user") -> int:
+    def remove_muted_peer(
+        self,
+        peer_id: int,
+        account_id: int = 0,
+        scope: str = "user",
+        chat_id: Optional[int] = None,
+    ) -> int:
+        """Снять мьют.
+
+        chat_id=None — убрать все записи этого человека (и глобальную, и по чатам).
+        chat_id=N — убрать только мьют для этого чата.
+        """
         with self._conn() as conn:
             cursor = conn.cursor()
             if scope == "chat":
                 cursor.execute(
                     "DELETE FROM muted_peers WHERE peer_key = ? AND scope = 'chat' AND (account_id = ? OR account_id = 0)",
                     (peer_id, account_id)
+                )
+            elif chat_id is not None:
+                cursor.execute(
+                    "DELETE FROM muted_peers WHERE peer_key = ? AND scope != 'chat' AND chat_id = ? "
+                    "AND (account_id = ? OR account_id = 0)",
+                    (peer_id, int(chat_id), account_id)
                 )
             else:
                 cursor.execute(
@@ -1734,6 +1771,8 @@ _MUTE_CACHE: Dict[int, Set[int]] = {}
 _MUTE_CHAT_CACHE: Dict[int, Set[int]] = {}
 _MUTE_ACTION_CACHE: Dict[int, Dict[int, str]] = {}
 _MUTE_ACTION_CHAT_CACHE: Dict[int, Dict[int, str]] = {}
+# Мьют человека только в одном чате: (chat_id, peer_key) -> действие.
+_MUTE_USER_CHAT_CACHE: Dict[int, Dict[Tuple[int, int], str]] = {}
 
 def _strip_peer_id(value: int) -> int:
     """Telegram user ids arrive as 1000000000000+id; store and match the plain id."""
@@ -1753,13 +1792,15 @@ def mute_cache_rebuild(account_id: int = 0):
         with db._conn() as conn:
             if account_id:
                 rows = conn.execute(
-                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action "
+                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action, "
+                    "COALESCE(chat_id, 0) AS chat_id "
                     "FROM muted_peers WHERE account_id = ? OR account_id = 0",
                     (account_id,)
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action FROM muted_peers"
+                    "SELECT peer_key, scope, COALESCE(action, 'silent') AS action, "
+                    "COALESCE(chat_id, 0) AS chat_id FROM muted_peers"
                 ).fetchall()
     except Exception:
         return
@@ -1768,10 +1809,12 @@ def mute_cache_rebuild(account_id: int = 0):
     chats = _MUTE_CHAT_CACHE.setdefault(account_id, set())
     user_actions = _MUTE_ACTION_CACHE.setdefault(account_id, {})
     chat_actions = _MUTE_ACTION_CHAT_CACHE.setdefault(account_id, {})
+    user_chat_actions = _MUTE_USER_CHAT_CACHE.setdefault(account_id, {})
     users.clear()
     chats.clear()
     user_actions.clear()
     chat_actions.clear()
+    user_chat_actions.clear()
     for r in rows:
         try:
             key = int(r["peer_key"])
@@ -1784,20 +1827,32 @@ def mute_cache_rebuild(account_id: int = 0):
             chats.add(key)
             chat_actions[key] = action
         else:
-            users.add(key)
-            user_actions[key] = action
+            mute_chat = int(r["chat_id"] or 0)
+            if mute_chat:
+                user_chat_actions[(mute_chat, key)] = action
+            else:
+                users.add(key)
+                user_actions[key] = action
 
 def is_peer_muted(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> bool:
     """True when the sender (or the chat itself) is muted for this account."""
     return mute_action_for(account_id, peer_id, chat_id) is not None
 
 def mute_action_for(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> Optional[str]:
-    """Действие мьюта для отправителя или чата. None — не заглушён."""
+    """Действие мьюта для отправителя или чата. None — не заглушён.
+
+    Приоритет: мьют человека в этом чате -> глобальный мьют человека ->
+    мьют всего чата.
+    """
     if peer_id is None and chat_id is None:
         return None
     try:
-        if peer_id is not None:
-            key = _strip_peer_id(peer_id)
+        key = _strip_peer_id(peer_id) if peer_id is not None else None
+        if key is not None and chat_id is not None:
+            action = _MUTE_USER_CHAT_CACHE.get(account_id, {}).get((int(chat_id), key))
+            if action:
+                return action
+        if key is not None:
             action = _MUTE_ACTION_CACHE.get(account_id, {}).get(key)
             if action:
                 return action
@@ -1811,9 +1866,12 @@ def mute_action_for(account_id: int, peer_id: Any, chat_id: Optional[int] = None
 
 
 def mute_scope_for(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> Optional[str]:
-    """'user' или 'chat' — в каком объёме сработал мьют."""
+    """'user', 'user_chat' или 'chat' — в каком объёме сработал мьют."""
     try:
-        if peer_id is not None and _strip_peer_id(peer_id) in _MUTE_CACHE.get(account_id, set()):
+        key = _strip_peer_id(peer_id) if peer_id is not None else None
+        if key is not None and chat_id is not None and (int(chat_id), key) in _MUTE_USER_CHAT_CACHE.get(account_id, {}):
+            return "user_chat"
+        if key is not None and key in _MUTE_CACHE.get(account_id, set()):
             return "user"
         if chat_id is not None and int(chat_id) in _MUTE_CHAT_CACHE.get(account_id, set()):
             return "chat"
@@ -3676,6 +3734,24 @@ class BroadcasterService:
             finally:
                 self._sending_chats.discard(chat_id)
 
+def _split_for_telegram(text: str, limit: int = 3800) -> List[str]:
+    """Разбить длинный текст на сообщения, не разрывая строки посередине."""
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in (text or "").splitlines():
+        line_len = len(line) + 1
+        if current and size + line_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
 HELP_TEXT = """
 **⚙️ Управление юзерботом**
 
@@ -3739,15 +3815,16 @@ HELP_TEXT = """
 • Живые вопросы («где купить рекламу?», «сколько стоит?») не трогаются. Если в чате есть непрочитанный ответ от живого человека, он остаётся непрочитанным.
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
 
-**9. Заглушение конкретных людей:**
-• `.мутить` — ответьте командой на сообщение (самый точный способ)
-• `.мутить @username` / `.мутить 123456789` — тихий режим: сообщения помечаются прочитанными, пинг и уведомление снимаются
+**9. Заглушение людей (все их сообщения, а не одно):**
+• `.мутить` — ответьте командой на любое сообщение человека: все его сообщения в любых чатах будут гаситься
+• `.мутить @username` / `.мутить 123456789` — то же по нику или id
+• `.мутить @username тут` — глушить только в этом чате, в остальных человек пишет как обычно
 • `.мутить @username удалить` — его сообщения сразу удаляются
 • `.мутить @username варн` — бот отвечает предупреждением
 • `.мутить @username бан` — снимает право писать (нужны права админа)
 • `.мутить чат` — тишина во всём этом чате
-• `.размутить @username` / `.заглушенные` — снять мьют и посмотреть список
-*(Заглушенные не запускают авто-подписку и не увеличивают счётчик рассылки)*
+• `.размутить @username` / `.размутить @username тут` / `.размутить чат` / `.заглушенные`
+*(Мьюты переживают перезапуск, работают для текста, медиа, стикеров и правок)*
 
 **10. Кнопки под постом:**
 • `.кнопки <название>` — пришли раскладку одним сообщением, одна строка = один ряд:
@@ -4138,6 +4215,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 return
 
         sender_id = event.sender_id
+        if sender_id is None:
+            from_id = getattr(event.message, "from_id", None)
+            sender_id = (
+                getattr(from_id, "user_id", None)
+                or getattr(from_id, "channel_id", None)
+                or getattr(from_id, "chat_id", None)
+            )
         # Our own other accounts never count and are never "spam".
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
@@ -4149,10 +4233,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 # В чате нельзя банить/предупреждать всех подряд — только тишина.
                 mute_action = "silent"
             log_info(f"[MUTE] Чат {chat_id}: сообщение от {sender_id}, действие '{mute_action}'.")
-            if mute_action != "silent":
-                await apply_mute_action(client, event.message, my_id, chat_id, mute_action)
-            else:
-                await mark_message_read(client, getattr(event, "input_chat", None) or chat_id, event.message, chat_id)
+            await apply_mute_action(client, event.message, my_id, chat_id, mute_action)
             return
 
         # Counter broadcasts run in the background: a slow media upload must
@@ -4211,15 +4292,21 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     async def edited_spam_handler(event: Any):
         # Spammers can add ads/hidden mentions after a harmless first message.
         # Do not touch counter broadcasts, subscriptions, or new-message dedup.
-        if not auto_read_spam or event.is_private:
-            return
         sender_id = event.sender_id
+        if sender_id is None:
+            from_id = getattr(event.message, "from_id", None)
+            sender_id = getattr(from_id, "user_id", None) or getattr(from_id, "channel_id", None)
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
-        if is_peer_muted(my_id, sender_id, event.chat_id):
-            await mark_message_read(
-                client, getattr(event, "input_chat", None) or event.chat_id, event.message, event.chat_id
-            )
+        mute_action = mute_action_for(my_id, sender_id, event.chat_id)
+        if mute_action:
+            if mute_scope_for(my_id, sender_id, event.chat_id) == "chat" and mute_action in ("ban", "warn"):
+                mute_action = "silent"
+            # Правка не должна обходить мьют: сообщение уже отредактировано,
+            # значит его тоже читаем/удаляем/предупреждаем.
+            await apply_mute_action(client, event.message, my_id, event.chat_id, mute_action)
+            return
+        if not auto_read_spam or event.is_private:
             return
         text = event.raw_text or ""
         message = event.message
@@ -4326,7 +4413,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         log_info(f"[CMD][{my_id}] Распознана команда '{cmd}' в чате {event.chat_id}")
 
         if cmd in (".инструкция", ".help"):
-            await _notify(event, HELP_TEXT, auto_delete=0)
+            for index, chunk in enumerate(_split_for_telegram(HELP_TEXT)):
+                await _notify(event, chunk, auto_delete=0, force_respond=index > 0)
             return
 
         if cmd in (".версия", ".version"):
@@ -5038,6 +5126,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             if reply_msg is not None:
                 sender_id = getattr(reply_msg, "sender_id", None)
                 if sender_id is None:
+                    # Анонимный админ или сообщение от имени канала: sender_id
+                    # пустой, но from_id всё ещё указывает на автора.
+                    from_id = getattr(reply_msg, "from_id", None)
+                    sender_id = (
+                        getattr(from_id, "user_id", None)
+                        or getattr(from_id, "channel_id", None)
+                        or getattr(from_id, "chat_id", None)
+                    )
+                if sender_id is None:
                     return None
                 peer_key = _strip_peer_id(sender_id)
                 display_name = ""
@@ -5123,6 +5220,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         action = "silent"
         rest_words: List[str] = []
         chat_scope = False
+        here_only = False
         for word in words:
             low = word.lower()
             if low in MUTE_ACTION_ALIASES:
@@ -5130,6 +5228,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 continue
             if low in ("чат", "chat", "беседа"):
                 chat_scope = True
+                continue
+            if low in ("тут", "здесь", "here", "локально", "этот"):
+                here_only = True
                 continue
             rest_words.append(word)
         rest = " ".join(rest_words).strip()
@@ -5163,10 +5264,14 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 "• `.мутить @username удалить` — удалять его сообщения\n"
                 "• `.мутить @username варн` — предупреждать в ответ\n"
                 "• `.мутить @username бан` — снимать право писать (нужны права)\n"
+                "• `.мутить @username тут` — глушить только в этом чате\n"
                 "• `.мутить чат` — тишина в этом чате",
             )
             return
 
+        mute_chat = 0
+        if target["scope"] != "chat" and here_only:
+            mute_chat = int(event.chat_id or 0)
         added = db.add_muted_peer(
             peer_id=target["peer_id"],
             account_id=my_id,
@@ -5176,6 +5281,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             scope=target["scope"],
             reason=target["reason"],
             action=action,
+            chat_id=mute_chat,
         )
         mute_cache_rebuild(my_id)
         verb = "Заглушен" if added else "Обновлён мьют"
@@ -5185,8 +5291,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             "warn": "в ответ уходит предупреждение",
             "ban": "снимается право писать в чате",
         }.get(action, action)
+        if target["scope"] == "chat":
+            where = "весь этот чат"
+        elif mute_chat:
+            where = "только в этом чате"
+        else:
+            where = "во всех чатах"
         reason_str = f"\nПричина: {target['reason']}" if target["reason"] else ""
-        await _notify(event, f"🔇 {verb}: **{target['display_name']}**\nРежим: {action_hint}{reason_str}")
+        await _notify(
+            event,
+            f"🔇 {verb}: **{target['display_name']}**\n"
+            f"Область: {where}. Режим: {action_hint}{reason_str}",
+        )
 
     async def handle_unmute(event: Any, raw: str):
         _, args = _extract_quoted_folder(raw)
@@ -5204,24 +5320,36 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 await _notify(event, "ℹ️ Этот чат не был заглушен.")
             return
 
-        target = await _resolve_mute_target(event, args_clean)
+        words = args_clean.split()
+        here_only = any(w.lower() in ("тут", "здесь", "here", "локально") for w in words)
+        args_clean = " ".join(w for w in words if w.lower() not in ("тут", "здесь", "here", "локально")).strip()
+        mute_chat = int(event.chat_id or 0) if here_only else None
+
+        target = await _resolve_mute_target(event, args_clean) if args_clean else None
         if target:
-            removed = db.remove_muted_peer(target["peer_key"], account_id=my_id, scope=target["scope"])
+            removed = db.remove_muted_peer(
+                target["peer_key"], account_id=my_id, scope=target["scope"], chat_id=mute_chat
+            )
         else:
-            token = args_clean.split()[0].lstrip("@")
-            found = db.find_muted_peer_by_username(token, account_id=my_id)
+            token = args_clean.split()[0].lstrip("@") if args_clean else ""
+            found = db.find_muted_peer_by_username(token, account_id=my_id) if token else None
             if found:
-                removed = db.remove_muted_peer(found["peer_key"], account_id=my_id, scope=found.get("scope") or "user")
+                removed = db.remove_muted_peer(
+                    found["peer_key"], account_id=my_id,
+                    scope=found.get("scope") or "user",
+                    chat_id=mute_chat,
+                )
                 target = {"display_name": found.get("display_name") or f"@{token}"}
             else:
                 removed = 0
-                target = {"display_name": token}
+                target = {"display_name": token or "этот человек"}
 
         mute_cache_rebuild(my_id)
+        where = " в этом чате" if here_only else ""
         if removed:
-            await _notify(event, f"🔊 Разглушен: **{target['display_name']}**")
+            await _notify(event, f"🔊 Разглушен{where}: **{target['display_name']}**")
         else:
-            await _notify(event, f"ℹ️ **{target['display_name']}** не был в списке заглушенных.")
+            await _notify(event, f"ℹ️ **{target['display_name']}** не был в списке заглушенных{where}.")
 
     async def handle_mute_list(event: Any):
         rows = db.list_muted_peers(account_id=my_id)
@@ -5235,7 +5363,12 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             label = r["display_name"] or handle
             reason = f" — {r['reason']}" if r["reason"] else ""
             mode = mode_titles.get(r.get("action") or "silent", "тихо")
-            scope = "чат" if (r.get("scope") or "user") == "chat" else "юзер"
+            if (r.get("scope") or "user") == "chat":
+                scope = "весь чат"
+            elif int(r.get("chat_id") or 0):
+                scope = f"чат {r.get('chat_id')}"
+            else:
+                scope = "везде"
             lines.append(f"• {label} (`{handle}`, {scope}, {mode}){reason}")
         if len(rows) > 50:
             lines.append(f"\n…и ещё {len(rows) - 50}")
@@ -5738,7 +5871,7 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
 def _write_credentials(api_id: int, api_hash: str, phone: str = ""):
     """Вписать ключи в config.txt, не ломая остальные настройки и аккаунты."""
     try:
-        text = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else DEFAULT_CONFIG
+        text = CONFIG_PATH.read_text(encoding="utf-8-sig") if CONFIG_PATH.exists() else DEFAULT_CONFIG
     except Exception:
         text = DEFAULT_CONFIG
     lines = text.splitlines()

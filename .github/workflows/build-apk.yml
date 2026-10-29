@@ -36,6 +36,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Selfcheck (без сети и Telegram)
+        run: python scripts/selfcheck.py
+
       # В репозитории android/app/src/main/python/ лежит только bot_bridge.py —
       # его удалять нельзя. Перезаписываем только генерируемые bot.py и cole/.
       - name: Prepare Android python sources
