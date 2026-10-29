@@ -72,7 +72,7 @@ def _attr_value(page: str, field: str, value_re: str) -> Optional[str]:
     patterns = (
         rf"""(?:id|name)=["']{field}["'][^>]{{0,300}}?value=["']({value_re})["']""",
         rf"""value=["']({value_re})["'][^>]{{0,300}}?(?:id|name)=["']{field}["']""",
-        rf"""for=["']{field}["'][^>]*>[\s\S]{{0,260}}?({value_re})""",
+        rf"""(?:id|name|for)=["']{field}["'][^>]*>[\s\S]{{0,600}}?({value_re})""",
     )
     for pattern in patterns:
         m = re.search(pattern, page, re.IGNORECASE | re.DOTALL)
@@ -94,6 +94,12 @@ def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
     raw_hash = _attr_value(page, "app_hash", r"[0-9a-fA-F]{32}")
     if raw_id and raw_hash:
         return {"api_id": int(raw_id), "api_hash": raw_hash.lower()}
+
+    # Последний шанс: значения в JS/JSON или в нестандартной разметке.
+    loose_id = re.search(r"app[_\"'\s:-]{0,20}id[^0-9]{0,80}(\d{4,12})", page, re.IGNORECASE)
+    loose_hash = re.search(r"app[_\"'\s:-]{0,20}hash[^0-9a-f]{0,80}([0-9a-f]{32})", page, re.IGNORECASE)
+    if loose_id and loose_hash:
+        return {"api_id": int(loose_id.group(1)), "api_hash": loose_hash.group(1).lower()}
 
     text = _strip_tags(page)
     id_match = re.search(r"api[\s_-]?id\D{0,60}?(\d{4,12})", text, re.IGNORECASE)
@@ -140,9 +146,24 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
 class MyTelegramAuth:
     """HTTP-клиент my.telegram.org с cookie-сессией."""
 
-    def __init__(self, timeout: float = 30.0, opener: Optional[urllib.request.OpenerDirector] = None):
+    def __init__(
+        self,
+        timeout: float = 30.0,
+        opener: Optional[urllib.request.OpenerDirector] = None,
+        cookie_path: Optional[str] = None,
+    ):
         self.timeout = timeout
-        self._jar = http.cookiejar.CookieJar()
+        self._cookie_path = Path(cookie_path) if cookie_path else None
+        if self._cookie_path is not None:
+            self._jar: http.cookiejar.CookieJar = http.cookiejar.LWPCookieJar(str(self._cookie_path))
+            if self._cookie_path.exists():
+                try:
+                    self._jar.load(ignore_discard=True, ignore_expires=False)
+                except Exception:
+                    # Битый/старый файл не мешает новому входу.
+                    pass
+        else:
+            self._jar = http.cookiejar.CookieJar()
         self._ssl = _ssl_context()
         if opener is not None:
             self._opener = opener
@@ -203,6 +224,34 @@ class MyTelegramAuth:
         return data
 
     # ------------------------------------------------------------------- steps
+    def has_session(self) -> bool:
+        """Есть ли сохранённая cookie входа my.telegram.org."""
+        try:
+            return any(cookie.name == "stel_token" for cookie in self._jar)
+        except Exception:
+            return False
+
+    def save_cookies(self) -> None:
+        if self._cookie_path is None:
+            return
+        try:
+            self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+            if hasattr(self._jar, "save"):
+                self._jar.save(ignore_discard=True, ignore_expires=False)
+        except Exception:
+            pass
+
+    def clear_cookies(self) -> None:
+        try:
+            self._jar.clear()
+        except Exception:
+            pass
+        if self._cookie_path is not None:
+            try:
+                self._cookie_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def send_code(self, phone: str) -> None:
         """Запросить код подтверждения. Код приходит в Telegram от сервиса."""
         phone = (phone or "").strip().replace(" ", "").replace("-", "")
@@ -226,13 +275,20 @@ class MyTelegramAuth:
         payload = self._json(
             self._open(
                 f"{SITE}/auth/login",
-                {"phone": self.phone, "random_hash": self.random_hash, "password": code},
+                {
+                    "phone": self.phone,
+                    "random_hash": self.random_hash,
+                    "password": code,
+                    "remember": "1",
+                },
             )
         )
         if payload.get("error"):
             raise ApiAuthError(_human_error(str(payload["error"])))
         self.authorized = True
+        self.save_cookies()
         self._verify_session()
+        self.save_cookies()
 
     def _verify_session(self) -> None:
         page = self._open(f"{SITE}/apps")
@@ -251,6 +307,7 @@ class MyTelegramAuth:
     def fetch_app(self) -> Optional[Dict[str, object]]:
         """Уже созданное приложение аккаунта, если оно есть."""
         page = self._open(f"{SITE}/apps")
+        self.save_cookies()
         return parse_apps_page(page)
 
     def create_app(
@@ -284,6 +341,7 @@ class MyTelegramAuth:
         )
         created = parse_apps_page(payload)
         if created:
+            self.save_cookies()
             return created
         again = self.fetch_app()
         if again:
@@ -291,6 +349,7 @@ class MyTelegramAuth:
         raise ApiAuthError("приложение не создалось, попробуй ещё раз или сделай вручную")
 
     def close(self) -> None:
+        self.save_cookies()
         self._jar.clear()
         self.authorized = False
         self.random_hash = ""

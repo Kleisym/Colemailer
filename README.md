@@ -316,7 +316,7 @@ python bot.py --check
 ```
 
 ```text
-Colemailer 3.4.2
+Colemailer 3.4.3
 config: /home/user/Colemailer/config.txt
 база:   /home/user/Colemailer/storage/bot.db
 аккаунтов: 2
@@ -590,6 +590,13 @@ GitHub Actions гоняет одно и то же на **Ubuntu, Windows и macO
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE). Пользуйся, меняй, распространяй.
+
+## Changelog 3.4.3
+
+- **Cookie-сессия my.telegram.org сохраняется** в `tg_api_cookies.txt`: после первого входа приложение сначала пробует взять api_id/api_hash по сохранённой cookie, без нового кода. Если приложение уже создано, код вообще не запрашивается.
+- **Парсер `/apps` стал терпимее:** значения ищутся в `id/name/value`, в `label for="app_id"` → `span/strong`, в тексте и в JS/JSON. Это лечит «приложение не создалось» на аккаунтах, где приложение уже есть.
+- Вход на my.telegram.org отправляет `remember=1`, чтобы cookie жила после перезапуска.
+- Версия 3.4.3.
 
 ## Changelog 3.4.2
 

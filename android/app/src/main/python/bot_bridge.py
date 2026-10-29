@@ -920,20 +920,34 @@ def auto_api(phone_val: str, files_dir_val: str) -> str:
 
     auth = None
     try:
-        _status("Запрос кода на my.telegram.org…", False)
-        log_line("INFO", "Запрос кода на my.telegram.org для %s" % phone)
-        auth = MyTelegramAuth()
-        auth.send_code(phone)
-        log_line("INFO", "Код отправлен в Telegram от сервиса")
-        code = _ask_code("Код из Telegram (my.telegram.org)")
-        auth.sign_in(code)
+        _status("Проверяю my.telegram.org…", False)
+        cookie_path = os.path.join(str(files_dir_val).strip(), "tg_api_cookies.txt")
+        auth = MyTelegramAuth(cookie_path=cookie_path)
+        # Сначала пробуем сохранённую cookie: если приложение уже создано,
+        # код из Telegram вообще не нужен.
         app = auth.fetch_app()
-        source = "existing"
+        source = "cookie"
+        if not app and auth.has_session():
+            try:
+                app = auth.create_app(title="Colemailer", shortname="colemailer")
+                source = "cookie"
+            except Exception:
+                app = None
         if not app:
-            app = auth.create_app(title="Colemailer", shortname="colemailer")
-            source = "created"
+            log_line("INFO", "Запрос кода на my.telegram.org для %s" % phone)
+            _status("Запрос кода на my.telegram.org…", False)
+            auth.send_code(phone)
+            log_line("INFO", "Код отправлен в Telegram от сервиса")
+            code = _ask_code("Код из Telegram (my.telegram.org)")
+            auth.sign_in(code)
+            app = auth.fetch_app()
+            source = "existing"
+            if not app:
+                app = auth.create_app(title="Colemailer", shortname="colemailer")
+                source = "created"
         api_id = int(app["api_id"])
         api_hash = str(app["api_hash"])
+        auth.save_cookies()
         _save_credentials(api_id, api_hash, phone)
         log_line("OK", "api_id получен (%s): %s" % (source, api_id))
         _status("Ключи получены", False)
