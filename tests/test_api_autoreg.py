@@ -5,9 +5,14 @@
 коду (сервер отвечает литералом `true`, а не JSON-объектом) и запись ключей в
 `config.txt` так, чтобы не затереть чужие секции и аккаунты.
 """
+import http.server
+import threading
+import urllib.parse
+
 import pytest
 
 import bot
+from cole import api_autoreg
 from cole.api_autoreg import (
     ApiAuthError,
     MyTelegramAuth,
@@ -152,6 +157,66 @@ def test_transport_never_passes_context_to_the_opener():
     auth.send_code("+79991234567")
     assert auth.random_hash == "abc123"
     assert opener.calls == ["https://my.telegram.org/auth/send_password"]
+
+
+class _LocalMyTelegram(http.server.BaseHTTPRequestHandler):
+    """Мини-копия my.telegram.org на localhost: реальный urllib и cookie-jar."""
+
+    def log_message(self, *args):
+        return
+
+    def _send(self, body: str, content_type: str = "text/html; charset=utf-8", cookie: str = ""):
+        raw = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path.startswith("/apps"):
+            if "session=ok" not in (self.headers.get("Cookie") or ""):
+                self._send('<form action="/auth/send_password"></form>')
+            else:
+                self._send(APPS_PAGE)
+        else:
+            self._send("not found")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        data = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+        if self.path.startswith("/auth/send_password"):
+            assert data.get("phone") == ["+79991234567"]
+            self._send('{"random_hash": "rh1"}', "application/json")
+        elif self.path.startswith("/auth/login"):
+            assert data.get("password") == ["12345"]
+            self._send("true", "application/json", cookie="session=ok; Path=/")
+        else:
+            self._send("not found")
+
+
+def test_full_flow_over_real_http_with_cookies(monkeypatch):
+    """Интеграционный прогон send_code -> sign_in -> fetch_app без фейкового opener."""
+    server = http.server.HTTPServer(("127.0.0.1", 0), _LocalMyTelegram)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        monkeypatch.setattr(api_autoreg, "SITE", base)
+        # Cookie выставляем вручную после login: сервер выше отвечает `true`,
+        # а fetch_app должен увидеть авторизованную страницу.
+        auth = MyTelegramAuth()
+        auth.send_code("+79991234567")
+        assert auth.random_hash == "rh1"
+        auth.sign_in("12345")
+        app = auth.fetch_app()
+        assert app == {"api_id": 1234567, "api_hash": "0123456789abcdef0123456789abcdef"}
+        auth.close()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # --------------------------------------------------------------------------- #

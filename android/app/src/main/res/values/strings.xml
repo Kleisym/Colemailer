@@ -122,6 +122,8 @@
     <!-- Тосты и сообщения -->
     <string name="toast_need_keys">Сначала заполните api_id и api_hash</string>
     <string name="toast_need_phone">Укажите номер телефона</string>
+    <string name="toast_bad_hash">api_hash должен быть 32 символа: 0-9, a-f</string>
+    <string name="toast_bad_phone">Номер должен быть в формате +79991234567</string>
     <string name="toast_saved">Сохранено</string>
     <string name="toast_error_fmt">Ошибка: %1$s</string>
     <string name="toast_auto_api_started">Запрос кода отправлен, ждём код из Telegram</string>

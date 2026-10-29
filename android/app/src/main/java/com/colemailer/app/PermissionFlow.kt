@@ -124,7 +124,10 @@ class PermissionFlow(private val activity: AppCompatActivity) {
     }
 
     fun openAutostart() {
-        val intent = OemAutostart.bestIntent(activity)
+        val intent = OemAutostart.bestIntent(activity)?.apply {
+            // Для startActivityForResult NEW_TASK не нужен и мешает вернуть результат.
+            flags = flags and Intent.FLAG_ACTIVITY_NEW_TASK.inv()
+        }
         if (intent == null || !launchForResult(autostartLauncher, intent)) {
             if (!OemAutostart.open(activity)) {
                 Toast.makeText(activity, R.string.toast_no_autostart_screen, Toast.LENGTH_LONG).show()

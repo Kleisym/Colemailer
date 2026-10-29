@@ -54,11 +54,18 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
     private fun saveKeys() {
         val apiId = etApiId.text?.toString()?.trim().orEmpty()
         val apiHash = etApiHash.text?.toString()?.trim().orEmpty()
-        val phone = etPhone.text?.toString()?.trim().orEmpty()
+        val phone = etPhone.text?.toString()?.trim().orEmpty().replace(" ", "").replace("-", "")
         val password = etPassword.text?.toString()?.trim().orEmpty()
 
-        if (apiId.isEmpty() || apiHash.length < 16) {
-            toast(getString(R.string.toast_need_keys))
+        if (apiId.isEmpty() || !Regex("^[0-9a-fA-F]{32}$").matches(apiHash)) {
+            setStatus(getString(R.string.toast_bad_hash), false)
+            toast(getString(R.string.toast_bad_hash))
+            return
+        }
+        val cleanPhone = phone.replace(" ", "").replace("-", "")
+        if (cleanPhone.isNotEmpty() && !Regex("^\\+\\d{7,15}$").matches(cleanPhone)) {
+            setStatus(getString(R.string.toast_bad_phone), false)
+            toast(getString(R.string.toast_bad_phone))
             return
         }
 
@@ -87,9 +94,14 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
     }
 
     private fun autoApi() {
-        val phone = etPhone.text?.toString()?.trim().orEmpty()
+        val phone = etPhone.text?.toString()?.trim().orEmpty().replace(" ", "").replace("-", "")
         if (phone.isEmpty()) {
             toast(getString(R.string.toast_need_phone))
+            return
+        }
+        if (!Regex("^\\+\\d{7,15}$").matches(phone)) {
+            setStatus(getString(R.string.toast_bad_phone), false)
+            toast(getString(R.string.toast_bad_phone))
             return
         }
 
