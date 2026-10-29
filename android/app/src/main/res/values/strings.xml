@@ -65,6 +65,11 @@
     <string name="btn_mark_autostart">Отметить как включённый</string>
     <string name="btn_app_details">Настройки приложения</string>
     <string name="btn_root_grants">Выдать всё через root</string>
+    <string name="btn_shizuku_grants">Выдать всё через Shizuku</string>
+    <string name="toast_shizuku_checking">Проверяю Shizuku…</string>
+    <string name="toast_shizuku_missing">Shizuku не запущен. Установи и запусти Shizuku, потом повтори.</string>
+    <string name="toast_shizuku_ok">Готово: права выданы через Shizuku</string>
+    <string name="toast_shizuku_failed">Shizuku есть, но команды не прошли. Показываю лог.</string>
     <string name="state_note_autostart">Без автозапуска сервис не поднимется после перезагрузки и свайпа</string>
     <string name="toast_root_checking">Проверяю root…</string>
     <string name="toast_root_unavailable">Root не найден — выдам через системные диалоги</string>

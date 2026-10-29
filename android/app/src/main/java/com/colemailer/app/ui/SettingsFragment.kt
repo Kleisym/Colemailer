@@ -1,6 +1,7 @@
 package com.colemailer.app.ui
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +18,7 @@ import com.colemailer.app.Prefs
 import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
 import com.colemailer.app.RootShell
+import com.colemailer.app.ShizukuShell
 import com.colemailer.app.UpdateManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -26,6 +28,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import rikka.shizuku.Shizuku
 
 /**
  * Настройки: антиспам/автосаб (ключи config.txt), чек-лист фона, версия.
@@ -55,6 +58,18 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
         installPending()
     }
 
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == ShizukuShell.REQUEST_CODE) {
+            activity?.runOnUiThread {
+                if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                    runShizukuGrant()
+                } else {
+                    Toast.makeText(requireContext(), R.string.toast_shizuku_missing, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
@@ -78,6 +93,8 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
             (activity as? MainActivity)?.permissionFlow?.requestAll()
         }
         view.findViewById<MaterialButton>(R.id.btn_root_grants).setOnClickListener { grantViaRoot() }
+        view.findViewById<MaterialButton>(R.id.btn_shizuku_grants).setOnClickListener { grantViaShizuku() }
+        runCatching { Shizuku.addRequestPermissionResultListener(shizukuPermissionListener) }
         view.findViewById<MaterialButton>(R.id.btn_open_autostart).setOnClickListener {
             (activity as? MainActivity)?.permissionFlow?.openAutostart()
         }
@@ -247,6 +264,53 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
                 pendingInfo = null
                 pendingFile = null
                 askedInstallPermission = false
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
+        super.onDestroyView()
+    }
+
+    /**
+     * Shizuku дает shell/ADB-права без root. Пользователь один раз запускает
+     * Shizuku, приложение запрашивает доступ и выполняет те же pm grant/appops.
+     */
+    private fun grantViaShizuku() {
+        if (!ShizukuShell.isBinderAlive()) {
+            Toast.makeText(requireContext(), R.string.toast_shizuku_missing, Toast.LENGTH_LONG).show()
+            runCatching {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/"))
+                )
+            }
+            return
+        }
+        if (!ShizukuShell.hasPermission()) {
+            if (!ShizukuShell.requestPermission()) {
+                Toast.makeText(requireContext(), R.string.toast_shizuku_missing, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        runShizukuGrant()
+    }
+
+    private fun runShizukuGrant() {
+        val context = requireContext().applicationContext
+        val button = view?.findViewById<MaterialButton>(R.id.btn_shizuku_grants) ?: return
+        button.isEnabled = false
+        Toast.makeText(requireContext(), R.string.toast_shizuku_checking, Toast.LENGTH_SHORT).show()
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) { ShizukuShell.grantAll(context) }
+            button.isEnabled = true
+            refreshBackgroundReport()
+            if (result.ok) {
+                Toast.makeText(requireContext(), R.string.toast_shizuku_ok, Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(requireContext(), R.string.toast_shizuku_failed, Toast.LENGTH_LONG).show()
+                tvBgReport.append("\n\nshizuku:\n")
+                tvBgReport.append(result.log.takeLast(1200))
             }
         }
     }

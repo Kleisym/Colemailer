@@ -25,24 +25,26 @@ object RootShell {
         return result.exit == 0 && result.output.contains("uid=0")
     }
 
+    fun grantCommands(pkg: String): List<String> = listOf(
+        "pm grant $pkg android.permission.POST_NOTIFICATIONS",
+        "appops set $pkg POST_NOTIFICATION allow",
+        "appops set $pkg RUN_IN_BACKGROUND allow",
+        "appops set $pkg RUN_ANY_IN_BACKGROUND allow",
+        "appops set $pkg WAKE_LOCK allow",
+        "appops set $pkg SCHEDULE_EXACT_ALARM allow",
+        "appops set $pkg USE_EXACT_ALARM allow",
+        "dumpsys deviceidle whitelist +$pkg",
+        "cmd deviceidle whitelist +$pkg",
+        "cmd appops set $pkg RUN_IN_BACKGROUND allow"
+    )
+
     /**
      * Выдать всё, что можно выдать через su. Возвращает человеческий лог:
      * какие команды прошли, какие нет (на разных прошивках набор appops разный).
      */
     fun grantAll(context: Context): Result {
         val pkg = context.packageName
-        val commands = listOf(
-            "pm grant $pkg android.permission.POST_NOTIFICATIONS",
-            "appops set $pkg POST_NOTIFICATION allow",
-            "appops set $pkg RUN_IN_BACKGROUND allow",
-            "appops set $pkg RUN_ANY_IN_BACKGROUND allow",
-            "appops set $pkg WAKE_LOCK allow",
-            "appops set $pkg SCHEDULE_EXACT_ALARM allow",
-            "appops set $pkg USE_EXACT_ALARM allow",
-            "dumpsys deviceidle whitelist +$pkg",
-            "cmd deviceidle whitelist +$pkg",
-            "cmd appops set $pkg RUN_IN_BACKGROUND allow"
-        )
+        val commands = grantCommands(pkg)
         val log = StringBuilder()
         var any = false
         for (command in commands) {

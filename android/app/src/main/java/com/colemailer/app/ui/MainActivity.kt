@@ -18,6 +18,7 @@ import com.colemailer.app.PermissionFlow
 import com.colemailer.app.Prefs
 import com.colemailer.app.R
 import com.colemailer.app.RootShell
+import com.colemailer.app.ShizukuShell
 import com.colemailer.app.UpdateManager
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import kotlinx.coroutines.Dispatchers
@@ -84,6 +85,18 @@ class MainActivity : AppCompatActivity() {
 
         permissionFlow.startOnFirstLaunch()
         autoCheckUpdates()
+        autoGrantIfPossible()
+    }
+
+    /**
+     * Если Shizuku уже запущен и доступ выдан, права выдаются при каждом
+     * старте сами — без кнопок. Если доступа нет, остаётся кнопка в настройках.
+     */
+    private fun autoGrantIfPossible() {
+        if (!ShizukuShell.isBinderAlive() || !ShizukuShell.hasPermission()) return
+        lifecycleScope.launch {
+            runCatching { withContext(Dispatchers.IO) { ShizukuShell.grantAll(applicationContext) } }
+        }
     }
 
     /**
