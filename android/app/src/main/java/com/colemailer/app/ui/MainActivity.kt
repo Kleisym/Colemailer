@@ -129,10 +129,11 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
             val result = withContext(Dispatchers.IO) { UpdateManager.install(applicationContext, file) }
-            val text = if (result == "root") {
-                getString(R.string.update_installed_root)
-            } else {
-                getString(R.string.update_installer_opened)
+            val text = when (result) {
+                "root" -> getString(R.string.update_installed_root)
+                "prompt" -> getString(R.string.update_installer_opened)
+                "permission" -> getString(R.string.update_need_install_permission)
+                else -> result
             }
             Toast.makeText(this@MainActivity, text, Toast.LENGTH_LONG).show()
         }
