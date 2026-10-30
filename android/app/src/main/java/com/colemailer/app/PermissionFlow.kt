@@ -79,9 +79,9 @@ class PermissionFlow(private val activity: AppCompatActivity) {
             }
             if (rooted?.ok == true) {
                 Toast.makeText(activity, R.string.toast_root_ok, Toast.LENGTH_LONG).show()
-            } else {
-                requestNext()
             }
+            // Root may grant only some permissions and does not enable the listener.
+            requestNext()
         }
     }
 

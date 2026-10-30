@@ -436,6 +436,7 @@ class MyTelegramAuth:
         code = (code or "").strip()
         if not code:
             raise ApiAuthError("пустой код")
+        self.authorized = False
         payload = self._json(
             self._open(
                 f"{SITE}/auth/login",
@@ -449,8 +450,8 @@ class MyTelegramAuth:
         )
         if payload.get("error"):
             raise ApiAuthError(_human_error(str(payload["error"])))
-        self.authorized = True
-        self.save_cookies()
+        if payload.get("ok") is False:
+            raise ApiAuthError("вход не подтвердился, проверь код и попробуй ещё раз")
         self._verify_session()
         self.save_cookies()
 
@@ -534,6 +535,7 @@ class MyTelegramAuth:
             "app_url": url or "",
             "app_platform": platform or "other",
             "app_desc": description or "",
+            "app_description": description or "",
         }
         # Отправляем ровно поля этой формы: у Telegram встречается и
         # app_desc, и app_description. hash берётся из формы создания, а не
