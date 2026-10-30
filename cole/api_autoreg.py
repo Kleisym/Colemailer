@@ -73,24 +73,13 @@ def _attr_value(page: str, field: str, value_re: str) -> Optional[str]:
     patterns = (
         rf"""(?:id|name)=["']{field}["'][^>]{{0,300}}?value=["']({value_re})["']""",
         rf"""value=["']({value_re})["'][^>]{{0,300}}?(?:id|name)=["']{field}["']""",
-        rf"""(?:id|name|for)=["']{field}["'][^>]*>[\s\S]{{0,600}}?({value_re})""",
+        rf"""(?:id|name|for)=["']{field}["'][^>]*>(?:(?!<label)[\s\S]){{0,600}}?({value_re})""",
     )
     for pattern in patterns:
         m = re.search(pattern, page, re.IGNORECASE | re.DOTALL)
         if m:
             return html_module.unescape(m.group(1))
     return None
-
-
-def _server_error(body: str) -> str:
-    """Текст ошибки из JSON-ответа my.telegram.org, если он там есть."""
-    try:
-        data = json.loads(body)
-    except Exception:
-        return ""
-    if isinstance(data, dict) and data.get("error"):
-        return _human_error(str(data["error"]))
-    return ""
 
 
 class _FormParser(HTMLParser):
@@ -106,7 +95,8 @@ class _FormParser(HTMLParser):
         values = dict(attrs)
         if tag == "form":
             self._current = {
-                "action": values.get("action") or "/apps",
+                "action": values.get("action") or "",
+                "id": values.get("id") or "",
                 "fields": {},
             }
             self.forms.append(self._current)
@@ -114,6 +104,10 @@ class _FormParser(HTMLParser):
         if self._current is None:
             return
         if tag in ("input", "textarea", "select") and values.get("name"):
+            if "disabled" in values:
+                return
+            if tag == "input" and (values.get("type") or "").lower() in ("radio", "checkbox") and "checked" not in values:
+                return
             self._current["fields"][values["name"]] = values.get("value") or ""
 
     def handle_endtag(self, tag: str) -> None:
@@ -170,8 +164,6 @@ def _app_links(page: str) -> list[str]:
         re.IGNORECASE,
     ):
         result.append(html_module.unescape(match))
-    for match in re.findall(r'/apps\?[^"\'\s<>]*app_id=[^"\'\s<>]+', page, re.IGNORECASE):
-        result.append(html_module.unescape(match))
     seen: set[str] = set()
     unique: list[str] = []
     for href in result:
@@ -189,22 +181,8 @@ def _create_form(page: str) -> Optional[dict]:
         return None
     for form in parser.forms:
         fields = form.get("fields") or {}
-        if "app_title" in fields or "app_shortname" in fields:
-            return form
-    return None
-
-
-def _app_form(page: str) -> Optional[dict]:
-    """Форма выбора приложения (скрытый app_id), если ссылки нет."""
-    parser = _FormParser()
-    try:
-        parser.feed(page)
-    except Exception:
-        return None
-    for form in parser.forms:
-        fields = form.get("fields") or {}
-        action = str(form.get("action") or "").lower()
-        if "app_id" in fields and "app_title" not in fields and "delete" not in action:
+        if (form.get("id") == "app_create_form" and
+                "app_title" in fields and "app_shortname" in fields):
             return form
     return None
 
@@ -214,9 +192,7 @@ def _valid_app(api_id: int, api_hash: str) -> bool:
         return False
     if not re.fullmatch(r"[0-9a-f]{32}", api_hash):
         return False
-    # Защита от ложного захвата: если id «выдернут» из начала хэша,
-    # это не пара ключей.
-    return not api_hash.startswith(str(api_id))
+    return True
 
 
 def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
@@ -251,7 +227,7 @@ def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
             return {"api_id": api_id, "api_hash": api_hash}
 
     text = re.sub(r"[\s\u00a0\u200b-]", "", _strip_tags(page))
-    id_match = re.search(r"api[_-]?id[^0-9]{0,80}?(\d{4,12})", text, re.IGNORECASE)
+    id_match = re.search(r"api[_-]?id(?:(?!api[_-]?hash)[^0-9]){0,80}?(\d{4,12})", text, re.IGNORECASE)
     hash_match = re.search(r"api[_-]?hash[^0-9a-f]{0,80}?([0-9a-f]{32})", text, re.IGNORECASE)
     if not id_match or not hash_match:
         return None
@@ -293,6 +269,20 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
         return None
 
 
+def _same_origin(url: str) -> bool:
+    expected = urllib.parse.urlsplit(SITE)
+    actual = urllib.parse.urlsplit(url)
+    return (actual.scheme == expected.scheme and actual.netloc == expected.netloc
+            and actual.username is None and actual.password is None)
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _same_origin(newurl):
+            raise ApiAuthError("переход на посторонний сайт отклонён")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class MyTelegramAuth:
     """HTTP-клиент my.telegram.org с cookie-сессией."""
 
@@ -318,7 +308,7 @@ class MyTelegramAuth:
         if opener is not None:
             self._opener = opener
         else:
-            handlers: list = [urllib.request.HTTPCookieProcessor(self._jar)]
+            handlers: list = [urllib.request.HTTPCookieProcessor(self._jar), _SameOriginRedirect()]
             if self._ssl is not None:
                 # context передаётся в HTTPSHandler при сборке opener:
                 # OpenerDirector.open() такого аргумента не принимает
@@ -331,6 +321,8 @@ class MyTelegramAuth:
 
     # ---------------------------------------------------------------- transport
     def _open(self, url: str, data: Optional[Dict[str, str]] = None, ajax: bool = True) -> str:
+        if not _same_origin(url):
+            raise ApiAuthError("запрос на посторонний сайт отклонён")
         body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
         headers = {
             "User-Agent": USER_AGENT,
@@ -351,8 +343,7 @@ class MyTelegramAuth:
                 charset = response.headers.get_content_charset() or "utf-8"
                 return raw.decode(charset, errors="replace")
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            raise ApiAuthError(f"HTTP {exc.code}: {_human_error(raw[:200])}") from exc
+            raise ApiAuthError(f"HTTP {exc.code} от my.telegram.org") from exc
         except urllib.error.URLError as exc:
             raise ApiAuthError(
                 f"нет связи с my.telegram.org ({exc.reason}). Нужен рабочий интернет или VPN."
@@ -395,15 +386,6 @@ class MyTelegramAuth:
         except Exception:
             pass
 
-    def _dump(self, tag: str, body: str) -> None:
-        """Сохранить ответ сайта при разборе ошибки — без него чинить нечем."""
-        if self._cookie_path is None:
-            return
-        try:
-            target = self._cookie_path.with_name(f"tg_{tag}_debug.html")
-            target.write_text(body or "", encoding="utf-8")
-        except Exception:
-            pass
 
     def clear_cookies(self) -> None:
         try:
@@ -473,7 +455,14 @@ class MyTelegramAuth:
         """Пройти по ссылкам списка приложений и разобрать карточку."""
         for href in _app_links(page):
             candidate = urllib.parse.urljoin(SITE, href)
-            if candidate.rstrip("/") == f"{SITE}/apps":
+            if not _same_origin(candidate):
+                continue
+            parsed = urllib.parse.urlsplit(candidate)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            if parsed.path == "/apps":
+                if set(query) != {"app_id"} or len(query["app_id"]) != 1 or not query["app_id"][0].isdigit():
+                    continue
+            elif not re.fullmatch(r"/apps/\d+", parsed.path) or parsed.query:
                 continue
             try:
                 detail = self._open(candidate)
@@ -484,17 +473,6 @@ class MyTelegramAuth:
                 self.save_cookies()
                 return found
 
-        form = _app_form(page)
-        if form:
-            try:
-                action = urllib.parse.urljoin(SITE, str(form.get("action") or "/apps"))
-                detail = self._open(action, dict(form.get("fields") or {}), ajax=False)
-                found = parse_apps_page(detail)
-                if found:
-                    self.save_cookies()
-                    return found
-            except Exception:
-                pass
         return None
 
     def fetch_app(self) -> Optional[Dict[str, object]]:
@@ -523,7 +501,6 @@ class MyTelegramAuth:
             return existing
         form = _create_form(page)
         if not form:
-            self._dump("apps_no_form", page)
             raise ApiAuthError(
                 "не нашёл форму создания приложения, зайди на my.telegram.org вручную"
             )
@@ -545,11 +522,13 @@ class MyTelegramAuth:
             if name in values:
                 data[name] = values[name]
         if not data.get("hash"):
-            self._dump("apps_no_hash", page)
             raise ApiAuthError("не нашёл hash формы создания приложения")
 
-        action = urllib.parse.urljoin(SITE, str(form.get("action") or "/apps"))
-        payload = self._open(action, data, ajax=False)
+        # The Telegram site's app_create_form is submitted by JavaScript.
+        form_action = str(form.get("action") or "")
+        if form_action and not _same_origin(urllib.parse.urljoin(SITE, form_action)):
+            raise ApiAuthError("форма создания ведёт на посторонний сайт")
+        payload = self._open(f"{SITE}/apps/create", data, ajax=False)
         created = parse_apps_page(payload)
         if created:
             self.save_cookies()
@@ -557,12 +536,7 @@ class MyTelegramAuth:
         again = self.fetch_app()
         if again:
             return again
-        self._dump("apps_create", payload)
-        reason = _server_error(payload)
-        if not reason:
-            snippet = _strip_tags(payload)[:180].strip()
-            reason = snippet or "ответ без ключей"
-        raise ApiAuthError("приложение не создалось: %s" % reason)
+        raise ApiAuthError("не удалось получить ключи после запроса создания; проверь приложение на my.telegram.org")
 
     def close(self) -> None:
         self.save_cookies()

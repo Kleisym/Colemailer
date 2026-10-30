@@ -42,7 +42,7 @@ CREATE_FORM_PAGE = """<!DOCTYPE html>
 <html><body>
   <div id="app_edit">
     <h4>Create new application</h4>
-    <form method="post" action="/apps">
+    <form id="app_create_form" method="post" action="/apps">
       <input type="hidden" name="hash" value="a1b2c3d4e5f6a7b8c9d0"/>
       <input type="text" name="app_title" value=""/>
       <input type="text" name="app_shortname" value=""/>
@@ -139,7 +139,7 @@ def test_create_app_uses_the_create_form_hash_not_a_delete_form():
       <input type="hidden" name="hash" value="DELETE_TOKEN">
       <input type="text" name="app_id" value="1">
     </form>
-    <form method="post" action="/apps">
+    <form id="app_create_form" method="post" action="/apps">
       <input type="hidden" name="hash" value="CREATE_TOKEN">
       <input type="text" name="app_title" value="">
       <input type="text" name="app_shortname" value="">
@@ -148,7 +148,7 @@ def test_create_app_uses_the_create_form_hash_not_a_delete_form():
     """
     opener = FakeOpener(
         get_pages={"/apps": page},
-        post_pages={"/apps": APPS_PAGE},
+        post_pages={"/apps/create": APPS_PAGE},
     )
     auth = make_auth(opener)
     auth.create_app(title="Colemailer", shortname="colemailer")
@@ -177,26 +177,6 @@ def test_fetch_app_follows_the_active_app_link():
     assert found == {"api_id": 1234567, "api_hash": "0123456789abcdef0123456789abcdef"}
     assert any("app_id=1234567" in call[1] for call in opener.calls)
 
-
-def test_fetch_app_submits_the_app_selection_form():
-    list_page = """
-    <form method="post" action="/apps">
-      <input type="hidden" name="hash" value="SELECT_TOKEN">
-      <input type="hidden" name="app_id" value="1234567">
-      <button>Open</button>
-    </form>
-    """
-    opener = FakeOpener(
-        get_pages={"/apps": list_page},
-        post_pages={"/apps": APPS_PAGE},
-    )
-    auth = make_auth(opener)
-
-    found = auth.fetch_app()
-
-    assert found == {"api_id": 1234567, "api_hash": "0123456789abcdef0123456789abcdef"}
-    post = [c for c in opener.calls if c[0] == "POST"][0]
-    assert b"app_id=1234567" in post[2]
 
 
 def test_parse_apps_page_returns_none_when_the_app_is_not_created_yet():
@@ -388,7 +368,7 @@ def test_sign_in_does_not_mark_failed_verification_authorized():
 
 def test_create_app_sends_description_under_alternate_field_name():
     page = CREATE_FORM_PAGE.replace("app_desc", "app_description")
-    opener = FakeOpener(get_pages={"/apps": page}, post_pages={"/apps": APPS_PAGE})
+    opener = FakeOpener(get_pages={"/apps": page}, post_pages={"/apps/create": APPS_PAGE})
     make_auth(opener).create_app(description="Example description")
     body = next(call[2] for call in opener.calls if call[0] == "POST")
     assert urllib.parse.parse_qs(body.decode())["app_description"] == ["Example description"]
@@ -462,7 +442,7 @@ def test_fetch_app_returns_existing_credentials():
 def test_create_app_reads_the_form_hash_and_returns_the_new_keys():
     opener = FakeOpener(
         get_pages={"/apps": CREATE_FORM_PAGE},
-        post_pages={"/apps": APPS_PAGE},
+        post_pages={"/apps/create": APPS_PAGE},
     )
     auth = make_auth(opener)
 
@@ -667,3 +647,79 @@ def test_write_credentials_creates_the_file_from_the_default(tmp_path, monkeypat
     glob = _key_value(global_part)
     assert glob["api_id"] == "777"
     assert glob["api_hash"] == "f" * 32
+
+def test_existing_edit_form_never_posted_as_creation():
+    page = '<h4>App configuration</h4><div>Active App</div><form id="app_edit_form"><input name="hash" value="secret"><input name="app_title"><input name="app_shortname"></form>'
+    opener = FakeOpener(get_pages={'/apps': page})
+    with pytest.raises(ApiAuthError):
+        make_auth(opener).create_app()
+    assert all(call[0] != 'POST' for call in opener.calls)
+
+
+def test_unknown_app_selection_form_never_posted():
+    page = '<form action="/apps"><input name="app_id" value="1234"><input name="hash" value="secret"></form>'
+    opener = FakeOpener(get_pages={'/apps': page})
+    assert make_auth(opener).fetch_app() is None
+    assert all(call[0] != 'POST' for call in opener.calls)
+
+
+def test_create_form_uses_telegram_javascript_endpoint():
+    page = '<form id="app_create_form"><input name="hash" value="secret"><input name="app_title"><input name="app_shortname"></form>'
+    opener = FakeOpener(get_pages={'/apps': page}, post_pages={'/apps/create': APPS_PAGE})
+    assert make_auth(opener).create_app()['api_id'] == 1234567
+    assert any(c[0] == 'POST' and c[1].endswith('/apps/create') for c in opener.calls)
+
+
+def test_external_form_actions_never_posted():
+    page = '<form id="app_create_form" action="https://evil.example/apps/create"><input name="hash" value="secret"><input name="app_title"><input name="app_shortname"></form>'
+    opener = FakeOpener(get_pages={'/apps': page})
+    with pytest.raises(ApiAuthError):
+        make_auth(opener).create_app()
+    assert all(call[0] != 'POST' for call in opener.calls)
+
+
+def test_external_active_app_link_not_followed():
+    page = '<a href="https://evil.example/apps?app_id=12345">Active App</a>'
+    opener = FakeOpener(get_pages={'/apps': page})
+    assert make_auth(opener).fetch_app() is None
+    assert len(opener.calls) == 1
+
+
+def test_failure_does_not_leak_html_or_hash(tmp_path):
+    page = '<form id="app_create_form"><input name="hash" value="secret"><input name="app_title"><input name="app_shortname"></form>'
+    opener = FakeOpener(get_pages={'/apps': page}, post_pages={'/apps/create': '<html>private secret</html>'})
+    auth = MyTelegramAuth(opener=opener, cookie_path=str(tmp_path/'cookies'))
+    with pytest.raises(ApiAuthError) as error:
+        auth.create_app()
+    assert 'secret' not in str(error.value)
+    assert not list(tmp_path.glob('*debug.html'))
+
+def test_data_copy_credentials_with_labels():
+    page = '<label for="app_id">App api_id:</label><span data-copy="1234567">hidden</span><label for="app_hash">App api_hash:</label><span data-copy="abcdef0123456789abcdef0123456789">hidden</span>'
+    assert parse_apps_page(page) == {'api_id': 1234567, 'api_hash': 'abcdef0123456789abcdef0123456789'}
+
+def test_valid_hash_may_begin_with_api_id():
+    page = '<p>App api_id: <b>1234567</b></p><p>App api_hash: <b>1234567abcdef123456789abcdef1234</b></p>'
+    assert parse_apps_page(page) == {'api_id': 1234567, 'api_hash': '1234567abcdef123456789abcdef1234'}
+
+
+def test_data_value_credentials_with_labels():
+    page = '<label for="app_id">App api_id:</label><span data-value="1234567">hidden</span><label for="app_hash">App api_hash:</label><span data-value="abcdef0123456789abcdef0123456789">hidden</span>'
+    assert parse_apps_page(page) == {'api_id': 1234567, 'api_hash': 'abcdef0123456789abcdef0123456789'}
+
+
+def test_form_parser_ignores_disabled_and_unchecked_controls():
+    page = '<form id="app_create_form"><input name="hash" value="token"><input name="app_title"><input name="app_shortname"><input type="radio" name="extra" value="wrong"><input type="radio" name="extra" value="right" checked><input name="disabled" value="bad" disabled></form>'
+    fields = api_autoreg._create_form(page)['fields']
+    assert fields['extra'] == 'right'
+    assert 'disabled' not in fields
+
+
+def test_cross_origin_redirect_refused():
+    request = api_autoreg.urllib.request.Request('https://my.telegram.org/apps')
+    with pytest.raises(ApiAuthError):
+        api_autoreg._SameOriginRedirect().redirect_request(request, None, 302, 'Found', {}, 'https://example.com/apps')
+
+def test_id_not_extracted_from_following_hash_with_small_numeric_prefix():
+    page = '<label for="app_id">App api_id:</label><div><span></span></div><label for="app_hash">App api_hash:</label><div><span>1234abcdef0123456789abcdef012345</span></div>'
+    assert parse_apps_page(page) is None
