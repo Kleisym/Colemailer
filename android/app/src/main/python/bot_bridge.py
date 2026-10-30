@@ -928,14 +928,12 @@ def auto_api(phone_val: str, files_dir_val: str) -> str:
         auth = MyTelegramAuth(cookie_path=cookie_path)
         # Сначала пробуем сохранённую cookie: если приложение уже создано,
         # код из Telegram вообще не нужен.
-        app = auth.fetch_app()
+        has_session = auth.has_session()
+        app = auth.fetch_app() if has_session else None
         source = "cookie"
-        if not app and auth.has_session():
-            try:
-                app = auth.create_app(title="Colemailer", shortname="colemailer")
-                source = "cookie"
-            except Exception:
-                app = None
+        if not app and has_session:
+            app = auth.create_app(title="Colemailer", shortname="colemailer")
+            source = "cookie"
         if not app:
             log_line("INFO", "Запрос кода на my.telegram.org для %s" % phone)
             _status("Запрос кода на my.telegram.org…", False)
