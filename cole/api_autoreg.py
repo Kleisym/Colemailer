@@ -454,7 +454,31 @@ class MyTelegramAuth:
                 charset = response.headers.get_content_charset() or "utf-8"
                 return raw.decode(charset, errors="replace")
         except urllib.error.HTTPError as exc:
-            raise ApiAuthError(f"HTTP {exc.code} от my.telegram.org") from exc
+            stage = {
+                "/auth/send_password": "запрос кода",
+                "/auth/login": "вход по коду",
+                "/apps": "чтение приложения",
+                "/apps/create": "создание приложения",
+            }.get(urllib.parse.urlsplit(url).path, "запрос")
+            details = []
+            try:
+                payload = json.loads(exc.read(16384).decode("utf-8", errors="replace"))
+                if isinstance(payload, dict):
+                    # Only fixed codes/field names can enter logs. Server text may
+                    # contain account information or authentication secrets.
+                    codes = set(_ERRORS) | {"APP_TITLE_INVALID", "APP_SHORTNAME_INVALID", "APP_SHORTNAME_OCCUPIED"}
+                    for key in ("error", "text"):
+                        value = payload.get(key)
+                        if isinstance(value, str) and value in codes:
+                            details.append(value)
+                            break
+                    field = payload.get("field")
+                    if field in ("app_title", "app_shortname", "app_url", "app_platform", "app_desc", "app_description"):
+                        details.append("поле " + field)
+            except (ValueError, TypeError, OSError):
+                pass
+            suffix = ": " + ", ".join(details) if details else ""
+            raise ApiAuthError(f"HTTP {exc.code} от my.telegram.org ({stage}){suffix}") from exc
         except urllib.error.URLError as exc:
             raise ApiAuthError(
                 f"нет связи с my.telegram.org ({exc.reason}). Нужен рабочий интернет или VPN."

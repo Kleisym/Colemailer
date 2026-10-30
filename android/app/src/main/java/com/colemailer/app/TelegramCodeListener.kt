@@ -43,7 +43,7 @@ class TelegramCodeListener : NotificationListenerService() {
         )
         for (pattern in patterns) {
             val match = pattern.find(text) ?: continue
-            return match.groupValues[1].uppercase()
+            return match.groupValues[1]
         }
         return null
     }
