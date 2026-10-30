@@ -362,6 +362,38 @@ def test_sign_in_accepts_a_literal_true_response():
     assert [c[0] for c in opener.calls] == ["POST", "GET"]
 
 
+def test_sign_in_rejects_literal_false_before_verifying_session():
+    opener = FakeOpener(get_pages={"/apps": APPS_PAGE}, post_pages={"/auth/login": "false"})
+    auth = make_auth(opener)
+    auth.phone = "+79991234567"
+    auth.random_hash = "deadbeef"
+    with pytest.raises(ApiAuthError):
+        auth.sign_in("12345")
+    assert auth.authorized is False
+    assert [call[0] for call in opener.calls] == ["POST"]
+
+
+def test_sign_in_does_not_mark_failed_verification_authorized():
+    opener = FakeOpener(
+        get_pages={"/apps": '<form action="/auth/send_password"></form>'},
+        post_pages={"/auth/login": "true"},
+    )
+    auth = make_auth(opener)
+    auth.phone = "+79991234567"
+    auth.random_hash = "deadbeef"
+    with pytest.raises(ApiAuthError):
+        auth.sign_in("12345")
+    assert auth.authorized is False
+
+
+def test_create_app_sends_description_under_alternate_field_name():
+    page = CREATE_FORM_PAGE.replace("app_desc", "app_description")
+    opener = FakeOpener(get_pages={"/apps": page}, post_pages={"/apps": APPS_PAGE})
+    make_auth(opener).create_app(description="Example description")
+    body = next(call[2] for call in opener.calls if call[0] == "POST")
+    assert urllib.parse.parse_qs(body.decode())["app_description"] == ["Example description"]
+
+
 def test_send_code_stores_the_random_hash():
     opener = FakeOpener(post_pages={"/auth/send_password": '{"random_hash": "abc123"}'})
     auth = make_auth(opener)
