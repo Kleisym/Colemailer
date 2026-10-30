@@ -318,7 +318,7 @@ python bot.py --check
 ```
 
 ```text
-Colemailer 3.4.7
+Colemailer 3.4.8
 config: /home/user/Colemailer/config.txt
 база:   /home/user/Colemailer/storage/bot.db
 аккаунтов: 2
@@ -592,6 +592,11 @@ GitHub Actions гоняет одно и то же на **Ubuntu, Windows и macO
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE). Пользуйся, меняй, распространяй.
+
+## Changelog 3.4.8
+
+- Мастер разрешений продолжает проверку после частичной выдачи прав через root.
+- Исправлены проверка ответа входа и поле описания при создании приложения Telegram.
 
 ## Changelog 3.4.7
 
