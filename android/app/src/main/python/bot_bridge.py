@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import json
 import os
 import random
@@ -901,7 +902,7 @@ def auto_api(phone_val: str, files_dir_val: str) -> str:
     Блокирующая: Kotlin зовёт её в отдельном потоке. Код подтверждения
     запрашивается у UI через тот же CODE_PROVIDER.
     """
-    phone = str(phone_val or "").strip().replace(" ", "")
+    phone = str(phone_val or "").strip().replace(" ", "").replace("-", "")
     if not phone:
         return json.dumps({"ok": False, "error": "номер не указан"}, ensure_ascii=False)
     try:
@@ -921,7 +922,9 @@ def auto_api(phone_val: str, files_dir_val: str) -> str:
     auth = None
     try:
         _status("Проверяю my.telegram.org…", False)
-        cookie_path = os.path.join(str(files_dir_val).strip(), "tg_api_cookies.txt")
+        # Old cookies have no account identity; never reuse them for another number.
+        phone_key = hashlib.sha256(phone.encode("utf-8")).hexdigest()
+        cookie_path = os.path.join(str(files_dir_val).strip(), f"tg_api_cookies_{phone_key}.txt")
         auth = MyTelegramAuth(cookie_path=cookie_path)
         # Сначала пробуем сохранённую cookie: если приложение уже создано,
         # код из Telegram вообще не нужен.
