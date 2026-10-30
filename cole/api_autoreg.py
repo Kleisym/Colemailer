@@ -195,6 +195,113 @@ def _valid_app(api_id: int, api_hash: str) -> bool:
     return True
 
 
+class _CredentialCards(HTMLParser):
+    """Read values from the same small container as each credential label."""
+
+    _void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = {"parent": None, "children": [], "values": [], "labels": set()}
+        self.stack = [self.root]
+        self.labels = {"id": [], "hash": []}
+        self.ignored = 0
+        self.modern = False
+        self.has_card = False
+        self.has_data_value = False
+
+    def handle_starttag(self, tag, attrs):
+        if self.ignored or tag in ("script", "style"):
+            if tag in ("script", "style"):
+                self.ignored += 1
+            return
+        parent = self.stack[-1]
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if classes.intersection({"cred", "vv"}):
+            self.modern = True
+        self.has_card |= "card" in classes
+        self.has_data_value |= any(key in ("data-copy", "data-value") for key, _ in attrs)
+        node = {"parent": parent, "children": [], "values": [], "labels": set(), "tag": tag, "value_text": "vv" in classes or parent.get("value_text", False)}
+        for key, value in attrs:
+            if key in ("data-copy", "data-value") and value:
+                node["values"].append(value)
+        parent["children"].append(node)
+        if tag not in self._void:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self._void and not self.ignored:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if self.ignored:
+            if tag in ("script", "style"):
+                self.ignored -= 1
+            return
+        if tag in self._void:
+            return
+        for idx in range(len(self.stack) - 1, 0, -1):
+            if self.stack[idx]["tag"] == tag:
+                del self.stack[idx:]
+                break
+
+    def handle_data(self, data):
+        if self.ignored:
+            return
+        node = self.stack[-1]
+        if node.get("value_text"):
+            node["values"].append(data)
+        for kind in ("id", "hash"):
+            if re.search(r"\bapi[\s_-]*" + kind + r"\b", data, re.IGNORECASE):
+                node["labels"].add(kind)
+                self.labels[kind].append(node)
+
+    @staticmethod
+    def _contents(node):
+        values = list(node["values"])
+        labels = set(node["labels"])
+        for child in node["children"]:
+            child_values, child_labels = _CredentialCards._contents(child)
+            values.extend(child_values)
+            labels.update(child_labels)
+        return values, labels
+
+    def value(self, kind):
+        pattern = r"\d{4,12}" if kind == "id" else r"[0-9a-fA-F]{32}"
+        matches = set()
+        for label in self.labels[kind]:
+            node = label
+            while node is not None and node is not self.root:
+                values, labels = self._contents(node)
+                if len(labels) > 1:
+                    break
+                candidates = {v.strip() for v in values if re.fullmatch(pattern, v.strip())}
+                if candidates:
+                    if len(candidates) != 1:
+                        return None
+                    matches.update(candidates)
+                    break
+                node = node["parent"]
+        return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _parse_credential_cards(page: str) -> tuple[bool, Optional[Dict[str, object]]]:
+    parser = _CredentialCards()
+    try:
+        parser.feed(page)
+        if not (parser.modern or (parser.has_card and parser.has_data_value)):
+            return False, None
+        raw_id = parser.value("id")
+        raw_hash = parser.value("hash")
+        if raw_id and raw_hash and _valid_app(int(raw_id), raw_hash.lower()):
+            return True, {"api_id": int(raw_id), "api_hash": raw_hash.lower()}
+    except (ValueError, RecursionError):
+        return True, None
+    return True, None
+
+
 def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
     """Достать api_id/api_hash со страницы /apps. None, если приложения нет.
 
@@ -202,6 +309,10 @@ def parse_apps_page(page: str) -> Optional[Dict[str, object]]:
     value="" инпута — поэтому сначала смотрим разметку по id/name, затем
     текст и JS/JSON. Пробелы и NBSP внутри значений нормализуются.
     """
+    handled, found = _parse_credential_cards(page)
+    if handled:
+        return found
+
     compact = re.sub(r"[\s\u00a0\u200b-]", "", page)
     raw_id = _attr_value(compact, "app_id", r"\d{4,12}")
     raw_hash = _attr_value(compact, "app_hash", r"[0-9a-fA-F]{32}")

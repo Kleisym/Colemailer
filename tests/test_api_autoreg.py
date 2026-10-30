@@ -723,3 +723,36 @@ def test_cross_origin_redirect_refused():
 def test_id_not_extracted_from_following_hash_with_small_numeric_prefix():
     page = '<label for="app_id">App api_id:</label><div><span></span></div><label for="app_hash">App api_hash:</label><div><span>1234abcdef0123456789abcdef012345</span></div>'
     assert parse_apps_page(page) is None
+
+
+def test_current_site_credential_cards_with_secret_badge():
+    page = '''<section class="credentials">
+      <div class="card"><div class="label">App api_id</div><div class="vv">24681357</div><button data-copy="24681357"></button></div>
+      <div class="card"><div class="label">App api_hash <span>secret</span></div><span class="vv" data-value="0123456789abcdef0123456789abcdef">••••</span><button data-copy="0123456789abcdef0123456789abcdef"></button></div>
+    </section>'''
+    assert parse_apps_page(page) == {'api_id': 24681357, 'api_hash': '0123456789abcdef0123456789abcdef'}
+
+
+def test_credential_cards_do_not_mix_unrelated_fields():
+    page = '''<div class="card"><div>App api_id</div><span>1234567</span></div>
+    <div class="card"><div>App api_hash <span>secret</span></div><span>hidden</span></div>
+    <div data-copy="0123456789abcdef0123456789abcdef"></div>'''
+    assert parse_apps_page(page) is None
+
+
+def test_card_ambiguous_values_never_fall_back_to_regex():
+    page = '''<section><div class="card"><div>App api_id:</div><span class="vv">24681357</span><button data-copy="13572468"></button></div>
+    <div class="card"><div>App api_hash:</div><span class="vv">0123456789abcdef0123456789abcdef</span></div></section>'''
+    assert parse_apps_page(page) is None
+
+
+def test_card_does_not_treat_unrelated_year_as_api_id():
+    page = '''<section><div class="card"><div>App api_id:</div><p>2024</p></div>
+    <div class="card"><div>App api_hash:</div><span class="vv">0123456789abcdef0123456789abcdef</span></div></section>'''
+    assert parse_apps_page(page) is None
+
+
+def test_card_data_copy_only_does_not_capture_unrelated_year():
+    page = '''<section><div class="card"><div>App api_id:</div><p>2024</p></div>
+    <div class="card"><div>App api_hash:</div><button data-copy="0123456789abcdef0123456789abcdef">0123456789abcdef0123456789abcdef</button></div></section>'''
+    assert parse_apps_page(page) is None
