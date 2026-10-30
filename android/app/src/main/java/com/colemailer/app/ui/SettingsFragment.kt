@@ -202,7 +202,7 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
                 return@launch
             }
             pendingInfo = info
-            val cached = UpdateManager.cachedFile(context, info)
+            val cached = withContext(Dispatchers.IO) { UpdateManager.cachedFile(context, info) }
             tvUpdateStatus.text = getString(R.string.update_available, info.version)
             if (cached != null) {
                 pendingFile = cached
@@ -236,9 +236,9 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
 
     private fun installPending() {
         if (!isAdded) return
-        val info = pendingInfo ?: return
+        if (pendingInfo == null) return
         val context = requireContext().applicationContext
-        val file = pendingFile ?: UpdateManager.cachedFile(context, info) ?: return
+        val file = pendingFile ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !requireContext().packageManager.canRequestPackageInstalls()
         ) {
