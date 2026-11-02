@@ -3,23 +3,23 @@ package com.colemailer.app
 import android.app.Notification
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.NotificationCompat
 import java.util.concurrent.TimeUnit
 
 /**
- * Читает код входа из уведомления Telegram и сразу отдаёт его в AuthQueue.
- *
- * Это не «доступ к чужим уведомлениям»: пользователь один раз включает
- * «Доступ к уведомлениям» для Colemailer, а сервис реагирует только когда
- * приложение само ждёт код my.telegram.org и только на пакеты Telegram.
+ * Локальный фильтр опубликованных уведомлений и ввод кода my.telegram.org.
+ * Отмена уведомления не гарантирует отмену уже начавшегося звука.
  */
 class TelegramCodeListener : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val notification = sbn?.notification ?: return
+        if (removeAdNotification(sbn, notification)) return
         if (!sbn.packageName.lowercase().contains("telegram")) return
         if (!AuthQueue.hasPending(AuthQueue.Kind.CODE)) return
         val age = System.currentTimeMillis() - notification.`when`
@@ -34,6 +34,28 @@ class TelegramCodeListener : NotificationListenerService() {
         ).filterNotNull().joinToString(" ")
         val code = extractCode(parts) ?: return
         AuthQueue.submit(AuthQueue.Kind.CODE, code)
+    }
+
+    private fun removeAdNotification(sbn: StatusBarNotification, notification: Notification): Boolean {
+        // Telegram reports private conversations as groups on Android < 9.
+        // A missing preview or unsupported format must never hide a real message.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !Prefs.filterAdNotifications ||
+            !AdNotificationFilter.supportsPackage(sbn.packageName)) return false
+        return try {
+            val style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)
+                ?: return false
+            if (style.messages.size > 25) return false
+            val texts = style.messages.map { it.text?.toString() }.toTypedArray()
+            if (!AdNotificationFilter.shouldDismiss(
+                    sbn.packageName, true,
+                    notification.flags and Notification.FLAG_GROUP_SUMMARY != 0,
+                    notification.flags and Notification.FLAG_ONGOING_EVENT != 0,
+                    style.isGroupConversation, texts)) return false
+            cancelNotification(sbn.key)
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun extractCode(text: String): String? {

@@ -86,6 +86,16 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
         tvVersion.text = appVersion()
         switchAutoUpdate.isChecked = Prefs.autoUpdate
         switchAutoUpdate.setOnCheckedChangeListener { _, checked -> Prefs.autoUpdate = checked }
+        view.findViewById<SwitchMaterial>(R.id.switch_notification_ads).apply {
+            isChecked = Prefs.filterAdNotifications
+            isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            setOnCheckedChangeListener { _, enabled ->
+                Prefs.filterAdNotifications = enabled
+                if (enabled && !TelegramCodeListener.isEnabled(requireContext())) {
+                    runCatching { startActivity(TelegramCodeListener.requestIntent()) }
+                }
+            }
+        }
         tvUpdateStatus.text = getString(R.string.update_current, appVersion())
         view.findViewById<MaterialButton>(R.id.btn_check_update).setOnClickListener { checkForUpdate() }
 
