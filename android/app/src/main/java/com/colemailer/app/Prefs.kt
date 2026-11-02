@@ -60,6 +60,11 @@ object Prefs {
         get() = sp.getBoolean("auto_update", true)
         set(value) = sp.edit().putBoolean("auto_update", value).apply()
 
+    /** Separate opt-in: notification removal covers all accounts in Telegram. */
+    var filterAdNotifications: Boolean
+        get() = sp.getBoolean("filter_ad_notifications", false)
+        set(value) = sp.edit().putBoolean("filter_ad_notifications", value).apply()
+
     var lastUpdateCheck: Long
         get() = sp.getLong("last_update_check", 0L)
         set(value) = sp.edit().putLong("last_update_check", value).apply()

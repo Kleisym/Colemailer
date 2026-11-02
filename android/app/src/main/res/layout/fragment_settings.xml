@@ -40,6 +40,19 @@
                     android:textColor="@color/on_surface" />
 
                 <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/switch_notification_ads"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/settings_notification_ads"
+                    android:textColor="@color/on_surface" />
+
+                <TextView
+                    style="@style/TextAppearance.Colemailer.Label"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/settings_notification_ads_note" />
+
+                <com.google.android.material.switchmaterial.SwitchMaterial
                     android:id="@+id/switch_autosub"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"

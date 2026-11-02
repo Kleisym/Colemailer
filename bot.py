@@ -2471,7 +2471,7 @@ def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = N
     score, _trigger, _factors = calculate_spam_score(text, message, ping_kind=ping_kind)
     if is_ping and score >= SPAM_THRESHOLD - 15:
         return True
-    return is_spam_message(text, message, ping_kind=ping_kind)[0]
+    return score >= SPAM_THRESHOLD
 
 def is_gatekeeper_text(text: str) -> bool:
     if not text:
@@ -4132,44 +4132,69 @@ def _mention_entity_kind(text: str, message: Any, my_id: int, names: List[str], 
     return kind
 
 
+PING_REPLY_TIMEOUT = 1.0
+
+
+def _direct_ping_kind(message: Any, text: str, my_id: int,
+                      usernames: List[str], names: List[str]) -> Optional[str]:
+    """Evidence already in the update; no reply fetch or entity resolution."""
+    ent_kind = _mention_entity_kind(text, message, my_id, names, usernames)
+    if ent_kind == "hidden":
+        return "stealth"
+    if text and any(re.search(rf"(?<![\w@])@{re.escape(u)}(?!\w)", text, re.IGNORECASE)
+                    for u in usernames if u):
+        return "username"
+    return ent_kind
+
+
 async def classify_ping(event: Any, message: Any, text: str, my_id: int,
                         usernames: List[str], names: List[str]) -> Optional[str]:
     """
-    How a message reached us: "reply", "username", "name", "stealth" or None.
+    How a message reached us: "reply", "username", "name", "stealth",
+    "unknown" or None.
 
     A reply to our own post is a ping even without @username or an entity: the
     old gate returned None before it ever looked at the reply, so ads sent as
-    answers to our message were never cleared. "stealth" stays as it was: a
-    mention Telegram flags but that is neither a reply nor a visible @handle.
+    answers to our message were never cleared. A bare Telegram ``mentioned``
+    flag is not enough: entities or a typed username must identify us.
     """
     mentioned = bool(getattr(message, "mentioned", False))
-    typed_username = bool(text) and any(
-        re.search(rf"(?<![\w@])@{re.escape(u)}(?!\w)", text, re.IGNORECASE) for u in usernames if u
-    )
-    ent_kind = _mention_entity_kind(text, message, my_id, names, usernames)
+    direct = _direct_ping_kind(message, text, my_id, usernames, names)
+    if direct:
+        return direct
 
     reply_is_ours = False
     if getattr(event, "is_reply", False):
         try:
-            reply_msg = await event.get_reply_message()
+            reply_msg = await asyncio.wait_for(event.get_reply_message(), timeout=PING_REPLY_TIMEOUT)
         except Exception:
-            reply_msg = None
+            # A failed lookup is not proof of a hidden tag on an ordinary reply.
+            return "unknown" if mentioned else None
+        if reply_msg is None:
+            return "unknown" if mentioned else None
         if reply_msg is not None and (
             getattr(reply_msg, "sender_id", None) == my_id or getattr(reply_msg, "out", False)
         ):
             reply_is_ours = True
 
-    if ent_kind == "hidden":
-        return "stealth"
     if reply_is_ours:
         return "reply"
-    if typed_username:
-        return "username"
-    if ent_kind == "name":
-        return "name"
     if mentioned:
-        return "stealth"
+        return "unknown"
     return None
+
+
+async def _spam_decision(event: Any, my_id: int, usernames: List[str], names: List[str]):
+    """Clear obvious ads without waiting for a reply RPC to classify the ping."""
+    text = event.raw_text or ""
+    message = event.message
+    if should_auto_read(text, message, is_ping=False):
+        direct = _direct_ping_kind(message, text, my_id, usernames, names)
+        # Preserve unrelated unread history when there is no personal mention.
+        return True, direct or ("unknown" if getattr(message, "mentioned", False) else None)
+    kind = await classify_ping(event, message, text, my_id, usernames, names)
+    actual_ping = kind not in (None, "unknown")
+    return should_auto_read(text, message, is_ping=actual_ping, ping_kind=kind), kind
 
 
 def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_id: int, acc_cfg: Optional[Dict[str, Any]] = None):
@@ -4238,31 +4263,38 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         # Counter broadcasts run in the background: a slow media upload must
         # not delay spam clearing or command handling.
-        active_broadcaster.on_incoming_message(chat_id)
         if event.is_private:
+            active_broadcaster.on_incoming_message(chat_id)
             return
 
         text = event.raw_text or ""
         message = event.message
 
-        # Did this message actually reach us, and how? reply to our post /
-        # our @handle typed / a mention of our name / a hidden ("stealth") tag.
-        # Only mentions trigger a reply lookup: fetching the replied message
-        # for every reply in every chat flooded the account with requests.
+        # Obvious ads reach the read RPC before counter/database work is queued.
         try:
-            ping_kind = await classify_ping(event, message, text, my_id, my_usernames, my_names)
+            if auto_read_spam:
+                clear_ad, ping_kind = await _spam_decision(event, my_id, my_usernames, my_names)
+            elif auto_sub and is_gatekeeper_text(text):
+                clear_ad = False
+                ping_kind = await classify_ping(event, message, text, my_id, my_usernames, my_names)
+            else:
+                clear_ad, ping_kind = False, None
         except Exception as e:
-            log_error(f"[PING] Не удалось разобрать упоминание: {e}")
+            log_error(f"[PING] Не удалось разобрать упоминание: {type(e).__name__}")
+            clear_ad = False
             ping_kind = "unknown" if getattr(message, "mentioned", False) else None
-        is_ping = ping_kind is not None
+        is_ping = ping_kind not in (None, "unknown")
 
-        if auto_read_spam:
-            target_peer = getattr(event, "input_chat", None) or chat_id
-            if should_auto_read(text, message, is_ping=is_ping, ping_kind=ping_kind if ping_kind != "unknown" else None):
-                await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id,
-                                         protect_unread_history=not is_ping)
-            elif is_ping:
-                note_genuine_ping(my_id, chat_id, msg_id or 0)
+        try:
+            if auto_read_spam:
+                target_peer = getattr(event, "input_chat", None) or chat_id
+                if clear_ad:
+                    await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id,
+                                             protect_unread_history=not is_ping)
+                elif is_ping:
+                    note_genuine_ping(my_id, chat_id, msg_id or 0)
+        finally:
+            active_broadcaster.on_incoming_message(chat_id)
 
         if auto_sub and is_gatekeeper_text(text):
             if is_ping or str(my_id) in text:
@@ -4311,15 +4343,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         text = event.raw_text or ""
         message = event.message
         try:
-            kind = await classify_ping(event, message, text, my_id, my_usernames, my_names)
+            clear_ad, kind = await _spam_decision(event, my_id, my_usernames, my_names)
         except Exception:
+            clear_ad = False
             kind = "unknown" if getattr(message, "mentioned", False) else None
-        if should_auto_read(text, message, is_ping=kind is not None,
-                            ping_kind=kind if kind != "unknown" else None):
+        if clear_ad:
             await clear_spam_mention(client, getattr(event, "input_chat", None) or event.chat_id,
                                      message, account_id=my_id, chat_id=event.chat_id,
-                                     protect_unread_history=kind is None)
-        elif kind is not None:
+                                     protect_unread_history=kind in (None, "unknown"))
+        elif kind not in (None, "unknown"):
             note_genuine_ping(my_id, event.chat_id, event.id)
 
     @client.on(events.Raw())

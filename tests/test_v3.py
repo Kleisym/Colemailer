@@ -163,8 +163,8 @@ class TestPingClassification(unittest.TestCase):
         ev = _Event(reply=_Msg(sender_id=self.ME, out=True), is_reply=True)
         self.assertEqual(self.classify("ок", _Msg(mentioned=True, entities=None), ev), "reply")
 
-    def test_mentioned_without_username_or_reply_is_stealth(self):
-        self.assertEqual(self.classify("звезды дешево", _Msg(mentioned=True, entities=None)), "stealth")
+    def test_mentioned_without_username_or_reply_is_unknown(self):
+        self.assertEqual(self.classify("звезды дешево", _Msg(mentioned=True, entities=None)), "unknown")
 
     def test_hidden_entity_is_stealth(self):
         text = "Скидки ⁠"

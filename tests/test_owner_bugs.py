@@ -42,16 +42,16 @@ AD_CAPTION = "🔥 Прайс\n🇮🇳 Индия (+91) - 30\n🇹🇷 Турц
 # --------------------------------------------------------------------------- #
 # (a) пинг без reply и пинг в подписи к медиа
 # --------------------------------------------------------------------------- #
-def test_a_non_reply_hidden_ping_is_stealth_and_cleared():
-    """Упоминание без reply и без видимого @ — скрытый тег, его гасим."""
+def test_a_bare_mentioned_flag_is_not_our_ping():
+    """Один флаг mentioned без entity не доказывает адресат сообщения."""
     msg = dict(mentioned=True, entities=[], media=None)
     from types import SimpleNamespace as NS
 
     kind = asyncio.run(bot.classify_ping(group_event(), NS(**msg), "Прайс на аккаунты",
                                          MY_ID, ["myuser"], ["Иван"]))
-    assert kind == "stealth"
-    assert bot.should_auto_read("Прайс на аккаунты", NS(**msg), is_ping=True,
-                               ping_kind=kind) is True
+    assert kind == "unknown"
+    assert bot.should_auto_read("Прайс на аккаунты", NS(**msg), is_ping=False,
+                               ping_kind=kind) is False
 
 
 def test_a_reply_to_a_third_party_is_not_our_ping():
@@ -62,7 +62,7 @@ def test_a_reply_to_a_third_party_is_not_our_ping():
     ev = group_event(is_reply=True, reply_to=reply, mentioned=True)
     msg = NS(mentioned=True, entities=[], media=None)
     kind = asyncio.run(bot.classify_ping(ev, msg, "🔥 прайс", MY_ID, ["myuser"], ["Иван"]))
-    assert kind == "stealth"
+    assert kind == "unknown"
 
 
 def test_a_ping_typed_in_a_media_caption_counts_as_username():
@@ -85,15 +85,15 @@ def test_a_ad_in_caption_without_typed_handle_is_cleared():
     assert bot.should_auto_read(AD_CAPTION, msg, is_ping=True, ping_kind="stealth") is True
 
 
-def test_a_media_caption_ping_reaches_clear_with_correct_flag(tmp_db):
-    """Обработчик обязан отдать медиа-пинг в clear_spam_mention с protect=False."""
+def test_a_media_ad_without_our_handle_preserves_unread_history(tmp_db):
+    """Чужой handle в рекламной подписи не снимает защиту истории."""
     client = RecordingClient()
     handlers = make_handlers(client)
     ev = group_event(text=AD_CAPTION, mentioned=True, media=MessageMediaPhoto(), mid=7010)
     with patch.object(bot, "clear_spam_mention", new_callable=AsyncMock) as clear_mock:
         asyncio.run(handlers["incoming_handler"](ev))
     assert clear_mock.await_count == 1
-    assert clear_mock.call_args.kwargs["protect_unread_history"] is False
+    assert clear_mock.call_args.kwargs["protect_unread_history"] is True
 
 
 # --------------------------------------------------------------------------- #
