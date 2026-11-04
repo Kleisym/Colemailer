@@ -13,7 +13,9 @@ final class AdNotificationFilter {
     private static final Pattern CATALOG = pattern("\\b(?:прайс\\w*|каталог\\w*|отзывы|price\\s*list)\\b");
     private static final Pattern CONTACT = pattern("\\b(?:писать|пишите|пиши|заказать|купить|обращайтесь|контакты|в\\s+лс|в\\s+личку)\\b");
     private static final Pattern PRICE = pattern("\\d+(?:[.,]\\d+)?\\s*(?:\\$|₽|€|руб\\w*|usd|ton|звезд\\w*)|\\$\\s*\\d+");
-    private static final Pattern WATERMARK = pattern("(?:отправлено|передано|переслано|опубликовано|sent|posted)\\s+(?:через|via|through|by)\\s+@[a-z0-9_]{4,32}\\s*$");
+    private static final Pattern WATERMARK = pattern("(?:отправлено|передано|переслано|опубликовано|sent|posted)\\s+(?:через|с\\s+помощью|при\\s+помощи|via|through|by)\\s+@[a-z0-9_]{4,32}\\s*$");
+    private static final Pattern TARIFF_HEADER = pattern("\\b(?:репост\\w*|размещени\\w*|рассылк\\w*|закреп\\w*)\\s*:");
+    private static final Pattern TARIFF_ROW = pattern("(?m)^[\\p{P}\\p{S}\\p{M} \\t]{0,8}\\d+[ \\t]*(?:минут(?:а|ы)?|час(?:а|ов)?|сут(?:ки|ок)|д(?:ень|ня|ней))[ \\t]*[-–—:=][ \\t]*\\d+(?:[.,]\\d+)?[ \\t]*(?:\\$|₽|€|v|ton|руб\\w*|звезд\\w*)?[\\p{P}\\p{S}\\p{M} \\t]*$");
     private static final Pattern AUTH = pattern("(?:my\\.telegram\\.org|login\\s*code|confirmation\\s*code|код\\s+(?:входа|подтверждения))");
 
     private static Pattern pattern(String expression) {
@@ -33,6 +35,11 @@ final class AdNotificationFilter {
         boolean catalogue = CATALOG.matcher(text).find();
         boolean routing = CONTACT.matcher(text).find();
         boolean price = PRICE.matcher(text).find();
+        if (contact && TARIFF_HEADER.matcher(text).find()) {
+            java.util.regex.Matcher rows = TARIFF_ROW.matcher(text);
+            int count = 0;
+            while (rows.find()) if (++count >= 3) return true;
+        }
         return contact && ((sale && (routing || catalogue || price))
                 || (catalogue && routing && price)
                 || (WATERMARK.matcher(text).find() && (sale || (catalogue && price))));
