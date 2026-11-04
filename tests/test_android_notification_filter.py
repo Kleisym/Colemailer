@@ -26,12 +26,17 @@ public class FilterTest {
             + "билайн\nмтс\nПИСАТЬ @seller_shop\nМОЯ РЕПУТАЦИЯ В ТИМЕ +rep\nОтправлено через @jaruvu";
         String seller = "ИЩУ ВЗЛОТЫ/ОП\n1 0 . 5 0\n@seller_shop\n"
             + "так же продаю привод кому интересно в лс\nпрайс + отзывы @review_shop\nПередано через @sendjarv";
-        String[] ads = {catalogue, seller, "Продам аккаунты по 100₽, пишите @seller_shop"};
+        String tariffs = "РЕПОСТЫ:\n10 минут — 1 Ⓥ\n30 минут — 1.5 Ⓥ\n1 час — 2.5 Ⓥ\n"
+            + "12 часов — 5 Ⓥ\n24 часа — 8 Ⓥ\nОтправлено с помощью @sender_bot";
+        String[] ads = {catalogue, seller, tariffs, "Продам аккаунты по 100₽, пишите @seller_shop",
+            "Продаю рекламу. Отправлено с помощью @sender_bot"};
         for (String ad : ads) { check(AdNotificationFilter.isAd(ad)); check(dismiss(ad)); }
         String[] normal = {"Привет, ответь", "почем реклама?", "скинь прайс пожалуйста",
             "@seller_shop", "Пришли прайс @shopname", "Куплю у тебя рекламу, есть место?",
             "Привет, вот @friendname", "Login code: 12345", "", "Ваш код подтверждения 12345",
-            "Продал телефон за 1000₽, спасибо @friendname", "Избранное: уведомления скрыты"};
+            "Продал телефон за 1000₽, спасибо @friendname", "Избранное: уведомления скрыты",
+            "РЕПОСТЫ: есть прайс? @seller_shop",
+            "Расписание встречи:\n10 минут — 1 вопрос\n30 минут — 2 вопрос\n1 час — 3 вопрос\n@friendname"};
         for (String text : normal) { check(!AdNotificationFilter.isAd(text)); check(!dismiss(text)); }
         check(dismiss(catalogue, seller));
         check(!dismiss(catalogue, "Привет, ответь"));

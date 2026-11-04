@@ -1784,6 +1784,27 @@ def _strip_peer_id(value: int) -> int:
         return v - 1000000000000
     return v
 
+def _message_sender_id(message: Any, fallback: Optional[int] = None) -> Optional[int]:
+    """Keep Telegram's user/chat/channel namespaces when sender_id is absent."""
+    sender_id = fallback if fallback is not None else getattr(message, "sender_id", None)
+    if sender_id is not None:
+        return sender_id
+    from_id = getattr(message, "from_id", None)
+    if from_id is None:
+        return None
+    try:
+        return utils.get_peer_id(from_id)
+    except (TypeError, ValueError, AttributeError):
+        # Old bridge objects may expose fields without a TL constructor.
+        if getattr(from_id, "user_id", None):
+            return int(from_id.user_id)
+        if getattr(from_id, "channel_id", None):
+            return -1000000000000 - int(from_id.channel_id)
+        if getattr(from_id, "chat_id", None):
+            return -int(from_id.chat_id)
+    return None
+
+
 def mute_cache_rebuild(account_id: int = 0):
     """Repopulate the in-memory mute index for an account."""
     if db is None:
@@ -2193,8 +2214,8 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
 
     ping_kind describes how the message reached us: "reply" (reply to our
     message), "username" (our @handle typed in the text), "name" (a regular
-    mention of our name), "stealth" (Telegram flagged it as a mention but it
-    is neither a reply nor a visible mention: a hidden tag) or None.
+    mention of our name), "stealth" (an entity tags us under an unrelated
+    label), "unknown" (mentioned flag without target evidence), or None.
     """
     if ping_kind == "stealth":
         return 100, "stealth_ping", ["hidden_mention_without_username_or_reply"]
@@ -3172,52 +3193,75 @@ async def clear_spam_mention(
     msg_id = getattr(message, "id", 0) or 0
     if not msg_id:
         return
-    input_peer = await _resolve_input_peer(client, chat_peer, message)
+    try:
+        input_peer = await asyncio.wait_for(_resolve_input_peer(client, chat_peer, message),
+                                             timeout=READ_RPC_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        input_peer = None
     if input_peer is None:
-        return
+        log_error(f"[READ] Антиспам: не удалось определить чат {chat_id} для сообщения {msg_id}")
+        return False
     is_channel = isinstance(input_peer, InputPeerChannel)
+    if is_channel:
+        contents = ChannelReadContentsRequest(channel=utils.get_input_channel(input_peer), id=[msg_id])
+        history = ChannelReadHistoryRequest(channel=utils.get_input_channel(input_peer), max_id=msg_id)
+    else:
+        contents = MessagesReadContentsRequest(id=[msg_id])
+        history = MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id)
 
-    try:
-        if is_channel:
-            await client(ChannelReadContentsRequest(channel=utils.get_input_channel(input_peer), id=[msg_id]))
-        else:
-            await client(MessagesReadContentsRequest(id=[msg_id]))
-    except Exception:
-        pass
+    async def read_history():
+        if protect_unread_history and not await _safe_to_read_ad_history(client, input_peer, msg_id):
+            return False
+        key_chat = chat_id if chat_id is not None else getattr(message, "chat_id", None)
+        pending_id, pending_ts = _pending_ping((account_id, key_chat)) if key_chat is not None else (0, 0.0)
+        if pending_id and pending_id < msg_id:
+            try:
+                res = await client(GetPeerDialogsRequest(peers=[InputDialogPeer(peer=input_peer)]))
+                read_max = res.dialogs[0].read_inbox_max_id if getattr(res, "dialogs", None) else 0
+            except Exception:
+                read_max = 0
+            if pending_id > read_max:
+                expired = pending_ts and (time.time() - pending_ts) > GENUINE_PING_TTL
+                if not expired and not await _preserve_ping(client, input_peer, key_chat, pending_id, account_id):
+                    return False
+                if expired:
+                    log_info(f"[ANTISPAM] Живой пинг {pending_id} протух, читаю чат дальше.")
+            _GENUINE_PINGS.pop((account_id, key_chat), None)
+        return await _read_rpc(client, history, "readHistory", chat_id, msg_id)
 
-    if protect_unread_history and not await _safe_to_read_ad_history(client, input_peer, msg_id):
-        return
-
-    # Is a real ping in this chat still unread? Then leave the history alone.
-    key_chat = chat_id if chat_id is not None else getattr(message, "chat_id", None)
-    pending_id, pending_ts = _pending_ping((account_id, key_chat)) if key_chat is not None else (0, 0.0)
-    if pending_id and pending_id < msg_id:
-        try:
-            res = await client(GetPeerDialogsRequest(peers=[InputDialogPeer(peer=input_peer)]))
-            read_max = res.dialogs[0].read_inbox_max_id if getattr(res, "dialogs", None) else 0
-        except Exception:
-            read_max = 0
-        if pending_id > read_max:
-            expired = pending_ts and (time.time() - pending_ts) > GENUINE_PING_TTL
-            if not expired and not await _preserve_ping(client, input_peer, key_chat, pending_id, account_id):
-                return
-            if expired:
-                log_info(f"[ANTISPAM] Живой пинг {pending_id} протух, читаю чат дальше.")
-        _GENUINE_PINGS.pop((account_id, key_chat), None)
-
-    try:
-        if is_channel:
-            await client(ChannelReadHistoryRequest(channel=utils.get_input_channel(input_peer), max_id=msg_id))
-        else:
-            await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
-    except Exception:
-        pass
+    results = await asyncio.gather(
+        _read_rpc(client, contents, "readMessageContents", chat_id, msg_id),
+        read_history(),
+    )
+    return all(results)
 
 
 _MUTE_WARN_COOLDOWN: Dict[Tuple[int, int], float] = {}
 
 
-async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any, chat_id: Optional[int] = None):
+READ_RPC_TIMEOUT = 3.0
+
+
+async def _read_rpc(client: TelegramClient, request: Any, stage: str,
+                    chat_id: Any, msg_id: int) -> bool:
+    """Bound each independent read RPC; report failures in errors-only mode."""
+    try:
+        result = await asyncio.wait_for(client(request), timeout=READ_RPC_TIMEOUT)
+        if result is not False:
+            return True
+        reason = "Telegram вернул False"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        reason = type(exc).__name__
+    log_error(f"[READ] {stage}: чат {chat_id}, сообщение {msg_id}: {reason}")
+    return False
+
+
+async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any,
+                            chat_id: Optional[int] = None) -> bool:
     """Снять с сообщения упоминание и прочитать его.
 
     send_read_acknowledge в Telethon 1.45 делает только readHistory, поэтому
@@ -3227,13 +3271,21 @@ async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any
     """
     msg_id = getattr(message, "id", 0) or 0
     if not msg_id:
-        return
+        return False
     target = chat_peer if chat_peer is not None else chat_id
     if target is None:
-        return
-    input_peer = await _resolve_input_peer(client, target, message)
+        log_error(f"[READ] Нет адреса чата для сообщения {msg_id}")
+        return False
+    try:
+        input_peer = await asyncio.wait_for(_resolve_input_peer(client, target, message),
+                                             timeout=READ_RPC_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        input_peer = None
     if input_peer is None:
-        return
+        log_error(f"[READ] Не удалось определить чат {chat_id} для сообщения {msg_id}")
+        return False
     from telethon.tl.types import InputPeerChannel
     from telethon.tl.functions.messages import (
         ReadHistoryRequest as MessagesReadHistoryRequest,
@@ -3244,20 +3296,20 @@ async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any
         ReadMessageContentsRequest as ChannelReadContentsRequest,
     )
     is_channel = isinstance(input_peer, InputPeerChannel)
-    try:
-        if is_channel:
-            await client(ChannelReadContentsRequest(channel=utils.get_input_channel(input_peer), id=[msg_id]))
-        else:
-            await client(MessagesReadContentsRequest(id=[msg_id]))
-    except Exception as e:
-        log_info(f"[READ] readMessageContents не прошёл ({type(e).__name__})")
-    try:
-        if is_channel:
-            await client(ChannelReadHistoryRequest(channel=utils.get_input_channel(input_peer), max_id=msg_id))
-        else:
-            await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
-    except Exception as e:
-        log_info(f"[READ] readHistory не прошёл ({type(e).__name__})")
+    if is_channel:
+        channel = utils.get_input_channel(input_peer)
+        contents = ChannelReadContentsRequest(channel=channel, id=[msg_id])
+        history = ChannelReadHistoryRequest(channel=channel, max_id=msg_id)
+    else:
+        contents = MessagesReadContentsRequest(id=[msg_id])
+        history = MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id)
+    # The requests are independent: a contents flood wait must not hold the
+    # history acknowledgement behind it.
+    results = await asyncio.gather(
+        _read_rpc(client, contents, "readMessageContents", chat_id, msg_id),
+        _read_rpc(client, history, "readHistory", chat_id, msg_id),
+    )
+    return all(results)
 
 
 async def apply_mute_action(
@@ -3266,7 +3318,8 @@ async def apply_mute_action(
     account_id: int,
     chat_id: Optional[int],
     action: str = "silent",
-):
+    chat_peer: Any = None,
+) -> bool:
     """Реакция на сообщение заглушённого человека.
 
     Уведомление уже улетело на телефон, когда апдейт дошёл до нас, поэтому
@@ -3274,12 +3327,13 @@ async def apply_mute_action(
     гасит пуш. Дальше — то, что выбрал владелец: удалить, предупредить, бан.
     """
     if message is None:
-        return
+        return False
     action = (action or "silent").lower()
     if action not in MUTE_ACTIONS:
         action = "silent"
 
-    await mark_message_read(client, getattr(message, "input_chat", None) or chat_id, message, chat_id)
+    read_ok = await mark_message_read(
+        client, chat_peer or getattr(message, "input_chat", None) or chat_id, message, chat_id)
 
     msg_id = getattr(message, "id", None)
     if action == "delete" and msg_id:
@@ -3287,10 +3341,10 @@ async def apply_mute_action(
             await client.delete_messages(chat_id, [msg_id])
         except Exception as e:
             log_info(f"[MUTE] Не удалось удалить сообщение {msg_id}: {type(e).__name__}")
-        return
+        return read_ok
 
     if action == "warn":
-        key = (int(account_id or 0), int(_strip_peer_id(getattr(message, "sender_id", 0) or 0)))
+        key = (int(account_id or 0), int(_strip_peer_id(_message_sender_id(message) or 0)))
         now = time.time()
         if now - _MUTE_WARN_COOLDOWN.get(key, 0.0) > 600:
             _MUTE_WARN_COOLDOWN[key] = now
@@ -3302,15 +3356,16 @@ async def apply_mute_action(
                 )
             except Exception:
                 pass
-        return
+        return read_ok
 
     if action == "ban":
-        sender_id = getattr(message, "sender_id", None)
+        sender_id = _message_sender_id(message)
         if sender_id:
             try:
                 await client.edit_permissions(chat_id, sender_id, view_messages=False)
             except Exception as e:
                 log_info(f"[MUTE] Бан не сработал в чате {chat_id}: {type(e).__name__}")
+    return read_ok
 
 
 class PartialSendError(Exception):
@@ -3816,7 +3871,7 @@ HELP_TEXT = """
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
 
 **9. Заглушение людей (все их сообщения, а не одно):**
-• `.мутить` — ответьте командой на любое сообщение человека: все его сообщения в любых чатах будут гаситься
+• `.мутить` — ответом на сообщение: сохранить мьют автора и сразу обработать этот пинг; следующие сообщения гасит работающий Colemailer
 • `.мутить @username` / `.мутить 123456789` — то же по нику или id
 • `.мутить @username тут` — глушить только в этом чате, в остальных человек пишет как обычно
 • `.мутить @username удалить` — его сообщения сразу удаляются
@@ -3839,6 +3894,7 @@ HELP_TEXT = """
 
 **12. Служебное:**
 • `.версия` — версия бота
+• `.пингдиаг` — ответом на сообщение: показать распознавание рекламы, адресата и мьют, не читая историю
 • `.рассылки` — все рассылки аккаунта
 • `.синк` — перечитать папки и подхватить новые чаты сразу
 """
@@ -4239,14 +4295,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             if _GLOBAL_DEDUP_RING.check_and_add((my_id, chat_id), msg_id):
                 return
 
-        sender_id = event.sender_id
-        if sender_id is None:
-            from_id = getattr(event.message, "from_id", None)
-            sender_id = (
-                getattr(from_id, "user_id", None)
-                or getattr(from_id, "channel_id", None)
-                or getattr(from_id, "chat_id", None)
-            )
+        sender_id = _message_sender_id(event.message, getattr(event, "sender_id", None))
         # Our own other accounts never count and are never "spam".
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
@@ -4258,7 +4307,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 # В чате нельзя банить/предупреждать всех подряд — только тишина.
                 mute_action = "silent"
             log_info(f"[MUTE] Чат {chat_id}: сообщение от {sender_id}, действие '{mute_action}'.")
-            await apply_mute_action(client, event.message, my_id, chat_id, mute_action)
+            await apply_mute_action(client, event.message, my_id, chat_id, mute_action,
+                                     chat_peer=getattr(event, "input_chat", None))
             return
 
         # Counter broadcasts run in the background: a slow media upload must
@@ -4324,10 +4374,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     async def edited_spam_handler(event: Any):
         # Spammers can add ads/hidden mentions after a harmless first message.
         # Do not touch counter broadcasts, subscriptions, or new-message dedup.
-        sender_id = event.sender_id
-        if sender_id is None:
-            from_id = getattr(event.message, "from_id", None)
-            sender_id = getattr(from_id, "user_id", None) or getattr(from_id, "channel_id", None)
+        sender_id = _message_sender_id(event.message, getattr(event, "sender_id", None))
         if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
         mute_action = mute_action_for(my_id, sender_id, event.chat_id)
@@ -4336,7 +4383,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 mute_action = "silent"
             # Правка не должна обходить мьют: сообщение уже отредактировано,
             # значит его тоже читаем/удаляем/предупреждаем.
-            await apply_mute_action(client, event.message, my_id, event.chat_id, mute_action)
+            await apply_mute_action(client, event.message, my_id, event.chat_id, mute_action,
+                                     chat_peer=getattr(event, "input_chat", None))
             return
         if not auto_read_spam or event.is_private:
             return
@@ -4426,7 +4474,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     ".размутить", ".размут", ".unmute", ".unignore",
                     ".заглушенные", ".мутлист", ".mutelist", ".рассылки", ".broadcasts",
                     ".кнопки", ".buttons", ".превью", ".preview",
-                    ".синк", ".sync", ".версия", ".version"
+                    ".синк", ".sync", ".версия", ".version", ".пингдиаг", ".pingdiag"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -4451,6 +4499,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         if cmd in (".версия", ".version"):
             await _notify(event, f"{APP_NAME} {APP_VERSION}", auto_delete=20)
+            return
+
+        if cmd in (".пингдиаг", ".pingdiag"):
+            await handle_ping_diagnostic(event)
             return
 
         if cmd in (".рассыл", ".broadcast"):
@@ -5133,6 +5185,40 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         )
         await _notify(event, f"{'🚫 Превью ссылок выключено' if value else '🖼 Превью ссылок включено'} для **{name}**.")
 
+    async def handle_ping_diagnostic(event: Any):
+        """Explain one replied message without changing its read state."""
+        reply = None
+        if getattr(event, "is_reply", False):
+            try:
+                reply = await asyncio.wait_for(event.get_reply_message(), timeout=READ_RPC_TIMEOUT)
+            except Exception:
+                pass
+        if reply is None:
+            await _notify(event, "Ответь `.пингдиаг` на сообщение: проверю рекламу, адресата и мьют.")
+            return
+        text = getattr(reply, "raw_text", None) or getattr(reply, "message", "") or ""
+        kind = await classify_ping(reply, reply, text, my_id, my_usernames, my_names)
+        is_ad = should_auto_read(text, reply, is_ping=kind not in (None, "unknown"), ping_kind=kind)
+        score, _trigger, factors = calculate_spam_score(text, reply, ping_kind=kind)
+        sender = _message_sender_id(reply)
+        source_chat = getattr(reply, "chat_id", None) or event.chat_id
+        is_private = bool(getattr(reply, "is_private", getattr(event, "is_private", False)))
+        action = mute_action_for(my_id, sender, source_chat)
+        decision = f"мьют {action}" if action else (
+            "антиспам" if is_ad and auto_read_spam and not is_private else "пропуск")
+        await _notify(
+            event,
+            f"{APP_NAME} {APP_VERSION}\n"
+            f"Реклама: {'да' if is_ad else 'нет'}; балл: {score}\n"
+            f"Факторы: {', '.join(factors[:8]) or 'нет'}\n"
+            f"Отправитель: `{sender}`\n"
+            f"Мьют: {action or 'нет'}; область: {mute_scope_for(my_id, sender, source_chat) or 'нет'}\n"
+            f"Адресный пинг: {kind or 'нет'}; Telegram mentioned: {bool(getattr(reply, 'mentioned', False))}\n"
+            f"Антиспам аккаунта: {'вкл' if auto_read_spam else 'выкл'}\n"
+            f"Ожидаемое действие: {decision}. Диагностика историю не читает.",
+            auto_delete=0,
+        )
+
     async def _resolve_mute_target(event: Any, raw_args: str) -> Optional[Dict[str, Any]]:
         """
         Resolve a mute target from a command argument.
@@ -5156,16 +5242,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             except Exception:
                 reply_msg = None
             if reply_msg is not None:
-                sender_id = getattr(reply_msg, "sender_id", None)
-                if sender_id is None:
-                    # Анонимный админ или сообщение от имени канала: sender_id
-                    # пустой, но from_id всё ещё указывает на автора.
-                    from_id = getattr(reply_msg, "from_id", None)
-                    sender_id = (
-                        getattr(from_id, "user_id", None)
-                        or getattr(from_id, "channel_id", None)
-                        or getattr(from_id, "chat_id", None)
-                    )
+                sender_id = _message_sender_id(reply_msg)
                 if sender_id is None:
                     return None
                 peer_key = _strip_peer_id(sender_id)
@@ -5188,6 +5265,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     "display_name": display_name or f"id {peer_key}",
                     "scope": "user",
                     "reason": reason,
+                    "reply_message": reply_msg,
                 }
 
         if not parts:
@@ -5316,6 +5394,14 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             chat_id=mute_chat,
         )
         mute_cache_rebuild(my_id)
+        current_read = None
+        reply_message = target.get("reply_message")
+        cross_chat_reply = reply_message is not None and (
+            getattr(reply_message, "chat_id", None) not in (None, event.chat_id))
+        if reply_message is not None and not cross_chat_reply:
+            current_read = await apply_mute_action(
+                client, reply_message, my_id, event.chat_id, action,
+                chat_peer=getattr(event, "input_chat", None))
         verb = "Заглушен" if added else "Обновлён мьют"
         action_hint = {
             "silent": "сообщения помечаются прочитанными, пинг снимается",
@@ -5330,10 +5416,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         else:
             where = "во всех чатах"
         reason_str = f"\nПричина: {target['reason']}" if target["reason"] else ""
+        current_hint = ""
+        if current_read is True:
+            current_hint = "\nТекущий пинг: запросы чтения выполнены."
+        elif current_read is False:
+            current_hint = "\nМьют сохранён, но снять текущий пинг не удалось. Подробности: [READ] в логе Colemailer."
+        elif cross_chat_reply:
+            current_hint = "\nЦитата другого чата: текущий чат не помечен прочитанным."
         await _notify(
             event,
             f"🔇 {verb}: **{target['display_name']}**\n"
-            f"Область: {where}. Режим: {action_hint}{reason_str}",
+            f"ID отправителя: `{target['peer_id']}`\n"
+            f"Область: {where}. Режим: {action_hint}{current_hint}{reason_str}",
         )
 
     async def handle_unmute(event: Any, raw: str):
