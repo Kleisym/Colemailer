@@ -98,6 +98,8 @@ session_name = session_userbot
 auto_sub_folder = автосабнутое
 auto_read_spam_pings = true
 auto_sub_enabled = true
+# авто-подписка только в чатах, где есть активная рассылка
+auto_sub_only_broadcast_chats = true
 
 # ==============================================================================
 # ДЛЯ ДОБАВЛЕНИЯ ВТОРОГО И ПОСЛЕДУЮЩИХ АККАУНТОВ (раскомментируйте блок ниже):
@@ -110,6 +112,7 @@ auto_sub_enabled = true
 # auto_sub_folder = автосабнутое
 # auto_read_spam_pings = true
 # auto_sub_enabled = true
+# auto_sub_only_broadcast_chats = true
 """
 
 def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
@@ -155,6 +158,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                     "auto_sub_folder": "автосабнутое",
                     "auto_read_spam_pings": True,
                     "auto_sub_enabled": True,
+                    "auto_sub_only_broadcast_chats": True,
                 }
                 accounts.append(current_acc)
                 continue
@@ -180,6 +184,8 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                         current_acc["auto_read_spam_pings"] = val.lower() in ("true", "1", "yes")
                     elif key == "auto_sub_enabled":
                         current_acc["auto_sub_enabled"] = val.lower() in ("true", "1", "yes")
+                    elif key == "auto_sub_only_broadcast_chats":
+                        current_acc["auto_sub_only_broadcast_chats"] = val.lower() in ("true", "1", "yes")
     else:
         single_acc = {
             "name": "default",
@@ -190,6 +196,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
             "auto_sub_folder": "автосабнутое",
             "auto_read_spam_pings": True,
             "auto_sub_enabled": True,
+            "auto_sub_only_broadcast_chats": True,
         }
         for raw_line in lines:
             line = raw_line.strip()
@@ -215,6 +222,8 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
                     single_acc["auto_read_spam_pings"] = val.lower() in ("true", "1", "yes")
                 elif key == "auto_sub_enabled":
                     single_acc["auto_sub_enabled"] = val.lower() in ("true", "1", "yes")
+                elif key == "auto_sub_only_broadcast_chats":
+                    single_acc["auto_sub_only_broadcast_chats"] = val.lower() in ("true", "1", "yes")
         accounts.append(single_acc)
 
     first = accounts[0] if accounts else {}
@@ -228,6 +237,7 @@ def load_config(config_file: Optional[Path] = None) -> Dict[str, Any]:
         "auto_sub_folder": first.get("auto_sub_folder", "автосабнутое"),
         "auto_read_spam_pings": first.get("auto_read_spam_pings", True),
         "auto_sub_enabled": first.get("auto_sub_enabled", True),
+        "auto_sub_only_broadcast_chats": first.get("auto_sub_only_broadcast_chats", True),
     }
 
 try:
@@ -983,6 +993,34 @@ class Database:
                     WHERE is_active = 1 AND mode IN ('interval', 'hybrid') AND interval_seconds > 0
                 """)
             return [dict(r) for r in cursor.fetchall()]
+
+    def has_active_broadcast(self, chat_id: Any, account_id: int = 0) -> bool:
+        """Whether this chat is an active destination for this account."""
+        if chat_id is None:
+            return False
+        with self._conn() as conn:
+            if account_id:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM broadcast_tasks
+                    WHERE chat_id = ? AND is_active = 1
+                      AND COALESCE(manual_stop, 0) = 0
+                      AND (account_id = ? OR account_id = 0)
+                    LIMIT 1
+                    """,
+                    (int(chat_id), int(account_id)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM broadcast_tasks
+                    WHERE chat_id = ? AND is_active = 1
+                      AND COALESCE(manual_stop, 0) = 0
+                    LIMIT 1
+                    """,
+                    (int(chat_id),),
+                ).fetchone()
+            return row is not None
 
     def increment_and_check_counter(self, chat_id: int, account_id: int = 0) -> List[Dict[str, Any]]:
         """Посчитать живое сообщение чата и, если условия сошлись, отдать задачу.
@@ -2195,6 +2233,19 @@ SUBSCRIBE_BUTTON_RE = re.compile(
     re.IGNORECASE,
 )
 
+UNSAFE_BUTTON_RE = re.compile(
+    r"(?:оплат\w*|плат[её]ж\w*|pay(?:ment)?|checkout|invoice|кошел\w*|wallet|"
+    r"крипт\w*|crypto|ton\b|usdt\b|btc\b|eth\b|stars?\b|звезд\w*|"
+    r"донат\w*|donate|купить|buy\b|обмен\w*|exchange|claim\b|airdrop|"
+    r"подар\w*|gift\b|казино|casino)",
+    re.IGNORECASE,
+)
+UNSAFE_BUTTON_URL_RE = re.compile(
+    r"(?:tonkeeper|wallet|crypto|cryptobot|pay|payment|invoice|checkout|"
+    r"fragment|stars|donat|casino|airdrop)|[?&](?:start|startapp|invoice|pay)=",
+    re.IGNORECASE,
+)
+
 
 def _utf16_slice(text: str, offset: int, length: int) -> str:
     try:
@@ -2616,6 +2667,27 @@ def is_subscribe_button(text: str) -> bool:
     return bool(text and SUBSCRIBE_BUTTON_RE.search(text.strip()))
 
 
+def _button_data_text(button: Any) -> str:
+    data = getattr(button, "data", None)
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="ignore")
+    return str(data)
+
+
+def is_unsafe_button(button: Any) -> bool:
+    """Reject payment/crypto/deep-link buttons before any click or join."""
+    label = str(getattr(button, "text", "") or "")
+    url = str(getattr(button, "url", "") or "")
+    data = _button_data_text(button)
+    return bool(
+        UNSAFE_BUTTON_RE.search(" ".join((label, url, data)))
+        or UNSAFE_BUTTON_URL_RE.search(url)
+        or UNSAFE_BUTTON_URL_RE.search(data)
+    )
+
+
 def gatekeeper_actions(message: Any, text: str) -> Tuple[Set[str], List[Tuple[int, int]], List[Tuple[int, int]]]:
     """Read join targets and action buttons from a mandatory-subscription post."""
     targets = set(extract_channel_links(text))
@@ -2625,13 +2697,20 @@ def gatekeeper_actions(message: Any, text: str) -> Tuple[Set[str], List[Tuple[in
     for r_idx, row in enumerate(getattr(markup, "rows", None) or []):
         for c_idx, button in enumerate(getattr(row, "buttons", None) or []):
             url = getattr(button, "url", None)
+            if is_unsafe_button(button):
+                continue
             if isinstance(url, str) and url:
                 targets.update(extract_channel_links(url))
             label = getattr(button, "text", "") or ""
             if is_subscribe_button(label):
-                subscribe_coords.append((r_idx, c_idx))
+                # URL subscription buttons are followed through the Telegram
+                # API, never clicked in the client.  This blocks hidden
+                # payment/deep-link actions behind a friendly label.
+                if not url:
+                    subscribe_coords.append((r_idx, c_idx))
             elif is_verify_button(label):
-                verify_coords.append((r_idx, c_idx))
+                if not url:
+                    verify_coords.append((r_idx, c_idx))
     return targets, subscribe_coords, verify_coords
 
 
@@ -3207,12 +3286,19 @@ async def join_and_silence_target(
             username = clean.lstrip("@").split("/")[-1].split("?")[0]
             entity = await client.get_entity(username)
             if getattr(entity, "bot", False):
-                start_param = ""
-                if "?start=" in clean:
-                    start_param = clean.split("?start=")[-1]
-                await client.send_message(entity, f"/start {start_param}".strip())
+                # A gatekeeper target can be a payment/crypto bot.  Never
+                # initiate a bot conversation automatically: /start may open
+                # invoices, wallets or paid subscriptions.
+                log_error(f"[AUTOSUB] Пропуск бота @{username}: /start отключён")
+                return False
             else:
-                await client(JoinChannelRequest(entity))
+                try:
+                    await client(JoinChannelRequest(entity))
+                except errors.UserAlreadyParticipantError:
+                    # Already joined is a successful subscription state.  Do
+                    # not skip the mute/folder steps just because Telegram
+                    # rejected a redundant JoinChannelRequest.
+                    log_info(f"[AUTOSUB] Уже подписан на @{username}, применяю mute и папку.")
 
         if entity:
             muted = await mute_peer(client, entity)
@@ -4042,7 +4128,7 @@ HELP_TEXT = """
 • Понимает обфускацию: латиница вместо кириллицы (`3вёзды`, `zвезды`), буквы через точки/пробелы, «красивые» шрифты, транслит.
 • Ловит скупку/продажу звёзд, TON, NFT-подарков, Premium/бустов, юзов, аккаунтов, «заработок», казино, накрутку, 18+, мошенничество, рекламу каналов и вотермарки автопостеров.
 • Живые вопросы («где купить рекламу?», «сколько стоит?») не трогаются. Если в чате есть непрочитанный ответ от живого человека, он остаётся непрочитанным.
-• Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
+• В чатах с активной рассылкой автоматически вступает в требуемые каналы, мьютит их и убирает в папку `автосабнутое`. Ботов, `/start`, оплату, криптокошельки и invoice-кнопки пропускает.
 
 **9. Заглушение людей (все их сообщения, а не одно):**
 • `.мутить` — ответом на сообщение: сохранить мьют автора и сразу обработать этот пинг; следующие сообщения гасит работающий Colemailer
@@ -4455,6 +4541,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     auto_read_spam = acc_cfg.get("auto_read_spam_pings", True)
     auto_sub = acc_cfg.get("auto_sub_enabled", True)
     auto_folder = acc_cfg.get("auto_sub_folder", "автосабнутое")
+    auto_sub_only_broadcast = acc_cfg.get("auto_sub_only_broadcast_chats", True)
     me_obj = getattr(client, "_self_user", None)
     my_username = getattr(me_obj, "username", None) or acc_cfg.get("username") or ""
     my_usernames: List[str] = [u for u in {my_username.lower()} if u]
@@ -4472,6 +4559,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         """Join required channels, mute them, file them and press the check."""
         if not auto_sub or not is_gatekeeper_message(event.message, text):
             return False
+        if auto_sub_only_broadcast and not db.has_active_broadcast(event.chat_id, account_id=my_id):
+            log_info(f"[AUTOSUB] Чат {event.chat_id}: пропуск, активной рассылки нет.")
+            return False
         targets, subscribe_coords, verify_coords = gatekeeper_actions(event.message, text)
         if not targets and not subscribe_coords:
             return False
@@ -4479,6 +4569,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         results = []
         for target in sorted(targets):
             results.append(await join_and_silence_target(client, target, auto_folder))
+        joined_ok = any(results)
 
         click = getattr(event.message, "click", None)
         if click is not None:
@@ -4492,14 +4583,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     raise
                 except Exception as exc:
                     log_error(f"[AUTOSUB] Не удалось нажать кнопку подписки {row}:{col}: {type(exc).__name__}")
-            for row, col in verify_coords:
-                try:
-                    await click(row, col)
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log_error(f"[AUTOSUB] Не удалось нажать кнопку проверки {row}:{col}: {type(exc).__name__}")
+            # Do not press «Проверить» when every discovered target was a
+            # skipped bot/payment link.  A callback can trigger side effects,
+            # so require a successful channel join (or a target-less check).
+            if joined_ok or (not targets and not subscribe_coords):
+                for row, col in verify_coords:
+                    try:
+                        await click(row, col)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log_error(f"[AUTOSUB] Не удалось нажать кнопку проверки {row}:{col}: {type(exc).__name__}")
         return bool(results) and all(results) or bool(subscribe_coords or verify_coords)
 
     @client.on(events.NewMessage(incoming=True))
@@ -6312,6 +6407,7 @@ async def main():
             "auto_sub_folder": CONFIG.get("auto_sub_folder", "автосабнутое"),
             "auto_read_spam_pings": CONFIG.get("auto_read_spam_pings", True),
             "auto_sub_enabled": CONFIG.get("auto_sub_enabled", True),
+            "auto_sub_only_broadcast_chats": CONFIG.get("auto_sub_only_broadcast_chats", True),
         }]
 
     valid_accounts = [a for a in accounts if a.get("api_id") and a.get("api_hash")]
@@ -6347,6 +6443,7 @@ async def main():
             "auto_sub_folder": "автосабнутое",
             "auto_read_spam_pings": True,
             "auto_sub_enabled": True,
+            "auto_sub_only_broadcast_chats": True,
         }
         valid_accounts = [acc]
 

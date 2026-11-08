@@ -54,8 +54,20 @@ def _gate_event(text, *, mid=91001, button_url="https://t.me/required_channel"):
     return ev
 
 
+def _enable_broadcast(tmp_db, chat_id=-1009988):
+    tmp_db.save_template("autosub_scope", "text", [], [])
+    tmp_db.add_or_update_broadcast(
+        chat_id=chat_id,
+        template_name="autosub_scope",
+        mode="interval",
+        interval_seconds=900,
+        account_id=987654321,
+    )
+
+
 def test_gatekeeper_without_personal_ping_joins_mutes_moves_and_checks(tmp_db):
     """Капча-бот не обязан адресовать аккаунт entity-упоминанием."""
+    _enable_broadcast(tmp_db)
     client = FolderClient([_folder()])
     handlers = bot.register_events(
         client,
@@ -73,11 +85,12 @@ def test_gatekeeper_without_personal_ping_joins_mutes_moves_and_checks(tmp_db):
     assert any(isinstance(req, JoinChannelRequest) for req in client.requests)
     assert any(isinstance(req, UpdateNotifySettingsRequest) for req in client.requests)
     assert any(isinstance(req, UpdateDialogFilterRequest) for req in client.requests)
-    assert event.message.click.await_args_list == [((0, 0), {}), ((0, 1), {})]
+    assert event.message.click.await_args_list == [((0, 1), {})]
 
 
 def test_button_only_gatekeeper_is_processed_without_text_or_ping(tmp_db):
     """Новая разметка Telegram может оставить только кнопку подписки."""
+    _enable_broadcast(tmp_db)
     client = FolderClient([_folder()])
     bot.register_events(
         client,
@@ -95,6 +108,7 @@ def test_button_only_gatekeeper_is_processed_without_text_or_ping(tmp_db):
 
 
 def test_callback_only_subscription_button_is_clicked_when_target_is_hidden(tmp_db):
+    _enable_broadcast(tmp_db)
     client = FolderClient([_folder()])
     bot.register_events(
         client,
