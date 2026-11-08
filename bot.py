@@ -494,30 +494,7 @@ class Database:
             except Exception:
                 pass
 
-            # Per-chat position inside a named rotation. A single global index
-            # meant that with 2 chats and 2 posts every chat always received
-            # the same post and never rotated.
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS rotation_progress (
-                    account_id INTEGER DEFAULT 0,
-                    rotation_id INTEGER,
-                    chat_id INTEGER,
-                    current_index INTEGER DEFAULT 0,
-                    PRIMARY KEY (account_id, rotation_id, chat_id)
-                )
-            """)
-
-            try:
-                cursor.execute("PRAGMA table_info(chat_rotations)")
-                cols = [r["name"] for r in cursor.fetchall()]
-                if "account_id" not in cols:
-                    cursor.execute("ALTER TABLE chat_rotations ADD COLUMN account_id INTEGER DEFAULT 0")
-                if "name" not in cols:
-                    cursor.execute("ALTER TABLE chat_rotations ADD COLUMN name TEXT DEFAULT ''")
-            except Exception:
-                pass
-
-            # Auto-migrate any existing records with < > in names
+            # Auto-migrate any existing records with < > in names.
             try:
                 cursor.execute("SELECT name, text, entities_hex, media_files, created_at FROM templates")
                 for r in cursor.fetchall():
@@ -542,9 +519,111 @@ class Database:
                     names = json.loads(r["template_names"]) if r["template_names"] else []
                     new_names = [n.strip("<>").strip() for n in names if n.strip("<>").strip()]
                     if new_names != names:
-                        cursor.execute("UPDATE chat_rotations SET template_names = ? WHERE id = ?", (json.dumps(new_names), r["id"]))
+                        cursor.execute("UPDATE chat_rotations SET template_names = ?, current_index = 0 WHERE id = ?", (json.dumps(new_names), r["id"]))
             except Exception:
                 pass
+
+            # Releases before account-aware task ownership could leave two
+            # rows for the same account/chat/template.  The scheduler treats
+            # every row as a separate delivery, so repair those rows before
+            # installing the invariant that prevents them from returning.
+            self._deduplicate_broadcast_tasks(cursor)
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_broadcast_tasks_unique "
+                "ON broadcast_tasks (account_id, chat_id, template_name)"
+            )
+
+            # Per-chat position inside a named rotation. A single global index
+            # meant that with 2 chats and 2 posts every chat always received
+            # the same post and never rotated.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rotation_progress (
+                    account_id INTEGER DEFAULT 0,
+                    rotation_id INTEGER,
+                    chat_id INTEGER,
+                    current_index INTEGER DEFAULT 0,
+                    PRIMARY KEY (account_id, rotation_id, chat_id)
+                )
+            """)
+
+            try:
+                cursor.execute("PRAGMA table_info(chat_rotations)")
+                cols = [r["name"] for r in cursor.fetchall()]
+                if "account_id" not in cols:
+                    cursor.execute("ALTER TABLE chat_rotations ADD COLUMN account_id INTEGER DEFAULT 0")
+                if "name" not in cols:
+                    cursor.execute("ALTER TABLE chat_rotations ADD COLUMN name TEXT DEFAULT ''")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _deduplicate_broadcast_tasks(cursor):
+        """Collapse legacy duplicate task rows without shortening a cooldown."""
+        duplicate_groups = cursor.execute(
+            """
+            SELECT account_id, chat_id, template_name, COUNT(*) AS n
+            FROM broadcast_tasks
+            GROUP BY account_id, chat_id, template_name
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        if not duplicate_groups:
+            return
+
+        cols = [row[1] for row in cursor.execute("PRAGMA table_info(broadcast_tasks)").fetchall()]
+        state_cols = {
+            "last_sent_at", "current_count", "counter_ready_at", "last_count_at",
+            "send_pending", "retry_at", "fail_count", "last_attempt_at",
+        }
+        for group in duplicate_groups:
+            rows = cursor.execute(
+                "SELECT * FROM broadcast_tasks WHERE account_id = ? AND chat_id = ? AND template_name = ?",
+                (group["account_id"], group["chat_id"], group["template_name"]),
+            ).fetchall()
+            # Prefer the row with the newest delivery/attempt state.  If no
+            # state exists, the highest id is the most recently configured row.
+            keep = max(
+                rows,
+                key=lambda row: (
+                    float(row["last_sent_at"] or 0.0),
+                    float(row["last_attempt_at"] or 0.0) if "last_attempt_at" in cols else 0.0,
+                    int(row["id"]),
+                ),
+            )
+            merged = {}
+            for name in state_cols:
+                if name in cols:
+                    values = [row[name] for row in rows]
+                    merged[name] = max((float(v or 0.0) for v in values), default=0.0) if name not in {"send_pending", "fail_count"} else max((int(v or 0) for v in values), default=0)
+            # A manual stop is a user decision and wins over a duplicate that
+            # was still active; otherwise keep the active state if any row was.
+            if "manual_stop" in cols:
+                merged["manual_stop"] = int(any(int(row["manual_stop"] or 0) for row in rows))
+            if "is_active" in cols:
+                merged["is_active"] = 0 if merged.get("manual_stop") else int(any(int(row["is_active"] or 0) for row in rows))
+            if "counter_threshold" in cols:
+                merged["counter_threshold"] = max(int(row["counter_threshold"] or 0) for row in rows)
+            if "interval_seconds" in cols:
+                merged["interval_seconds"] = max(int(row["interval_seconds"] or 0) for row in rows)
+            if "mode" in cols:
+                # The newest row carries the latest user-selected mode.
+                merged["mode"] = keep["mode"]
+            if "folder_name" in cols:
+                merged["folder_name"] = keep["folder_name"] or next((row["folder_name"] for row in rows if row["folder_name"]), "")
+
+            assignments = []
+            params = []
+            for name, value in merged.items():
+                if name in cols:
+                    assignments.append(f"{name} = ?")
+                    params.append(value)
+            if assignments:
+                params.append(keep["id"])
+                cursor.execute(f"UPDATE broadcast_tasks SET {', '.join(assignments)} WHERE id = ?", params)
+            cursor.execute(
+                "DELETE FROM broadcast_tasks WHERE account_id = ? AND chat_id = ? AND template_name = ? AND id != ?",
+                (group["account_id"], group["chat_id"], group["template_name"], keep["id"]),
+            )
 
     def save_template(
         self,
@@ -2111,6 +2190,11 @@ VERIFY_BUTTON_TEXTS = [
     "вступил", "продолжить", "я не бот", "check", "done", "verify", "i subscribed", "i'm not a bot",
 ]
 
+SUBSCRIBE_BUTTON_RE = re.compile(
+    r"(?:подпис(?:аться|ывайся)|вступ(?:ить|ай)|join|subscribe)",
+    re.IGNORECASE,
+)
+
 
 def _utf16_slice(text: str, offset: int, length: int) -> str:
     try:
@@ -2500,14 +2584,23 @@ def is_gatekeeper_text(text: str) -> bool:
     clean = text.lower()
     return any(p.search(clean) for p in GATEKEEPER_PATTERNS)
 
+
 def extract_channel_links(text: str) -> List[str]:
     if not text:
         return []
     targets = set()
-    for m in re.findall(r"(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_+-]+)", text):
-        clean = m.strip("/")
+    for prefix, raw_target in re.findall(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/((?:joinchat/|\+)?)([a-zA-Z0-9_+\-]+)",
+        text,
+        re.IGNORECASE,
+    ):
+        clean = (prefix + raw_target).strip("/.,;:!?)]}>")
         if clean:
             targets.add(clean)
+    for m in re.findall(r"tg://join\?invite=([a-zA-Z0-9_+\-]+)", text, re.IGNORECASE):
+        clean = m.strip("/.,;:!?)]}>")
+        if clean:
+            targets.add(f"tg://join?invite={clean}")
     for m in re.findall(r"@([a-zA-Z0-9_]{4,32})", text):
         targets.add(m)
     return list(targets)
@@ -2517,6 +2610,40 @@ def is_verify_button(text: str) -> bool:
         return False
     clean = text.lower().strip()
     return any(v in clean for v in VERIFY_BUTTON_TEXTS)
+
+
+def is_subscribe_button(text: str) -> bool:
+    return bool(text and SUBSCRIBE_BUTTON_RE.search(text.strip()))
+
+
+def gatekeeper_actions(message: Any, text: str) -> Tuple[Set[str], List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Read join targets and action buttons from a mandatory-subscription post."""
+    targets = set(extract_channel_links(text))
+    subscribe_coords: List[Tuple[int, int]] = []
+    verify_coords: List[Tuple[int, int]] = []
+    markup = getattr(message, "reply_markup", None)
+    for r_idx, row in enumerate(getattr(markup, "rows", None) or []):
+        for c_idx, button in enumerate(getattr(row, "buttons", None) or []):
+            url = getattr(button, "url", None)
+            if isinstance(url, str) and url:
+                targets.update(extract_channel_links(url))
+            label = getattr(button, "text", "") or ""
+            if is_subscribe_button(label):
+                subscribe_coords.append((r_idx, c_idx))
+            elif is_verify_button(label):
+                verify_coords.append((r_idx, c_idx))
+    return targets, subscribe_coords, verify_coords
+
+
+def is_gatekeeper_message(message: Any, text: str) -> bool:
+    """Recognise mandatory-subscription posts even when text was deleted."""
+    if is_gatekeeper_text(text):
+        return True
+    targets, subscribe_coords, verify_coords = gatekeeper_actions(message, text)
+    # A callback-only post may have no URL and no remaining text.  Its
+    # "Подписаться" button is still the gatekeeper signal; clicking it is the
+    # only way to reveal the channel target.
+    return bool((targets and (subscribe_coords or verify_coords)) or (not text and subscribe_coords))
 
 def serialize_entities(entities: Optional[List[Any]]) -> List[str]:
     if not entities:
@@ -2896,10 +3023,25 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
     return (await get_folder_chats(client, folder_name)) or []
 
 
+def _is_named_dialog_filter(dialog_filter: Any, folder_name: str) -> bool:
+    """Match both current and future Telegram dialog-filter TL shapes."""
+    title = _extract_folder_title(dialog_filter).strip().casefold()
+    return bool(title) and title == (folder_name or "").strip().casefold()
+
+
+def _dialog_filter_weight(dialog_filter: Any) -> int:
+    """Prefer a populated/flagged filter when old versions left duplicates."""
+    peers = len(getattr(dialog_filter, "include_peers", []) or [])
+    peers += len(getattr(dialog_filter, "pinned_peers", []) or [])
+    flags = sum(bool(getattr(dialog_filter, key, False)) for key in (
+        "groups", "broadcasts", "contacts", "non_contacts", "bots"
+    ))
+    return peers + flags * 100000
+
+
 async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional[List[int]]:
     """Chat ids of a Telegram folder, or None when no folder has that title."""
     result = await client(GetDialogFiltersRequest())
-    target_clean = folder_name.lower().strip()
     target_filter = None
 
     for f in getattr(result, "filters", []):
@@ -2908,11 +3050,9 @@ async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional
         # an isinstance whitelist silently turned every unrecognised one into
         # "folder not found". Matching on the title alone is what actually
         # decides whether this filter is the folder we asked for.
-        if hasattr(f, "title") or hasattr(f, "id"):
-            title = _extract_folder_title(f).lower()
-            if title == target_clean:
+        if (hasattr(f, "title") or hasattr(f, "id")) and _is_named_dialog_filter(f, folder_name):
+            if target_filter is None or _dialog_filter_weight(f) > _dialog_filter_weight(target_filter):
                 target_filter = f
-                break
 
     if not target_filter:
         return None
@@ -2926,7 +3066,7 @@ async def get_folder_chats(client: TelegramClient, folder_name: str) -> Optional
             pass
 
     exclude_ids = set()
-    for peer in getattr(target_filter, "exclude_peers", []):
+    for peer in getattr(target_filter, "exclude_peers", []) or []:
         try:
             cid = utils.get_peer_id(peer)
             exclude_ids.add(cid)
@@ -2978,38 +3118,53 @@ async def mute_peer(client: TelegramClient, peer: Any):
             peer=InputNotifyPeer(input_peer),
             settings=InputPeerNotifySettings(mute_until=2147483647)
         ))
-    except Exception:
-        pass
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_error(f"[AUTOSUB] Не удалось заглушить канал/бота: {type(exc).__name__}: {exc}")
+        return False
 
 async def add_peer_to_folder(client: TelegramClient, folder_name: str, peer: Any):
     try:
         input_peer = await client.get_input_entity(peer)
         result = await client(GetDialogFiltersRequest())
         filters = getattr(result, "filters", [])
-        target_clean = folder_name.lower().strip()
-
         target_filter = None
         max_id = 1
 
         for f in filters:
             fid = getattr(f, "id", 0)
-            if fid > max_id:
+            if isinstance(fid, int) and fid > max_id:
                 max_id = fid
-            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and _extract_folder_title(f).lower() == target_clean:
-                target_filter = f
-                break
+            # Do not use an isinstance whitelist here. Telegram added
+            # DialogFilterChatlist successors without changing the fields we
+            # need, and treating those as unknown created duplicate folders.
+            if _is_named_dialog_filter(f, folder_name):
+                if target_filter is None or _dialog_filter_weight(f) > _dialog_filter_weight(target_filter):
+                    target_filter = f
 
         if target_filter:
             current_peers = list(getattr(target_filter, "include_peers", []))
-            peer_ids = {utils.get_peer_id(p) for p in current_peers}
+            peer_ids = set()
+            for current in current_peers:
+                try:
+                    peer_ids.add(utils.get_peer_id(current))
+                except Exception:
+                    continue
             new_id = utils.get_peer_id(input_peer)
+            excluded = []
+            for current in list(getattr(target_filter, "exclude_peers", []) or []):
+                try:
+                    if utils.get_peer_id(current) != new_id:
+                        excluded.append(current)
+                except Exception:
+                    excluded.append(current)
+            target_filter.exclude_peers = excluded
             if new_id not in peer_ids:
                 current_peers.append(input_peer)
                 target_filter.include_peers = current_peers
-                await client(UpdateDialogFilterRequest(
-                    id=target_filter.id,
-                    filter=target_filter
-                ))
+            await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
         else:
             new_id = max_id + 1
             new_filter = DialogFilter(
@@ -3020,8 +3175,13 @@ async def add_peer_to_folder(client: TelegramClient, folder_name: str, peer: Any
                 exclude_peers=[]
             )
             await client(UpdateDialogFilterRequest(id=new_id, filter=new_filter))
-    except Exception:
-        pass
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_error(f"[AUTOSUB] Не удалось добавить канал в папку "
+                  f"{folder_name!r}: {type(exc).__name__}: {exc}")
+        return False
 
 async def join_and_silence_target(
     client: TelegramClient,
@@ -3031,8 +3191,14 @@ async def join_and_silence_target(
     try:
         entity = None
         clean = target.strip()
-        if clean.startswith("+") or "joinchat/" in clean:
-            invite_hash = clean.split("+")[-1].split("joinchat/")[-1]
+        if clean.startswith("tg://join?invite="):
+            invite_hash = clean.split("invite=", 1)[1].split("&", 1)[0]
+            updates = await client(ImportChatInviteRequest(invite_hash))
+            chats = getattr(updates, "chats", [])
+            if chats:
+                entity = chats[0]
+        elif clean.startswith("+") or "joinchat/" in clean or "/+" in clean:
+            invite_hash = clean.split("+")[-1].split("joinchat/")[-1].split("?", 1)[0]
             updates = await client(ImportChatInviteRequest(invite_hash))
             chats = getattr(updates, "chats", [])
             if chats:
@@ -3049,11 +3215,18 @@ async def join_and_silence_target(
                 await client(JoinChannelRequest(entity))
 
         if entity:
-            await mute_peer(client, entity)
-            await add_peer_to_folder(client, folder_name, entity)
+            muted = await mute_peer(client, entity)
+            moved = await add_peer_to_folder(client, folder_name, entity)
+            if not muted or not moved:
+                log_error(
+                    f"[AUTOSUB] {target}: подписка выполнена, "
+                    f"но mute={'ok' if muted else 'fail'}, folder={'ok' if moved else 'fail'}"
+                )
             return True
-    except Exception:
-        pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_error(f"[AUTOSUB] Не удалось вступить в {target!r}: {type(exc).__name__}: {exc}")
     return False
 
 
@@ -3816,6 +3989,7 @@ HELP_TEXT = """
 • `.рассыл через 1 <название>`
 • `.рассыл через 3 <название> "папка"`
 • `.рассыл через 10 соо минимум 10 минут <название>` — **совмещенный (гибридный) режим**: отправка через 10 сообщений, но не чаще раза в 10 минут
+• `.рассыл через 15 соо и 15 минут <название>` — та же логика в разговорной форме
 • `.рассыл комби 10 10м <название> "папка"` — краткая форма комбинированного режима
 • Английские аналоги: `.broadcast every 15s <name>`, `.broadcast after 10 <name>`, `.broadcast hybrid 10 10m <name>`
 *(Текст можно писать со 2-й строки или отправить команду в ответ на готовое сообщение)*
@@ -4013,26 +4187,35 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
     pattern_hybrid_kw = re.compile(
         rf"^(?:через|after)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
         rf"\s+(?:но\s+что\s*бы\s+|но\s+|что\s*бы\s+)?(?:кд|cd|минимум|min|пауза|задержка|от|не\s+чаще)\s*(\d+)\s*({time_units})?"
-        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло|минимум|min))?"
         rf"\s+(.+)$",
         re.IGNORECASE
     )
     pattern_hybrid_unit = re.compile(
         rf"^(?:через|after)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
         rf"\s+(\d+)\s*({time_units})"
-        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло|минимум|min))?"
         rf"\s+(.+)$",
         re.IGNORECASE
     )
     pattern_hybrid_direct = re.compile(
         rf"^(?:комби|комбинированное|гибрид|hybrid)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
         rf"\s+(?:(?:но\s+что\s*бы\s+|но\s+|что\s*бы\s+)?(?:кд|cd|минимум|min|пауза|задержка|от|не\s+чаще)\s*)?(\d+)\s*({time_units})?"
-        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло|минимум|min))?"
         rf"\s+(.+)$",
         re.IGNORECASE
     )
 
     args_text = " ".join(tokens[1:])
+    # Users naturally write «через 15 соо и 15 минут».  Treat the
+    # conjunction as prose, not as the template name (the old parser fell
+    # back to counter mode and therefore ignored the 15-minute floor).
+    args_text = re.sub(
+        rf"^((?:через|after)\s+\d+(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?\s+)(?:и|and)\s+",
+        r"\1",
+        args_text,
+        flags=re.IGNORECASE,
+    )
     m_hyb = pattern_hybrid_kw.match(args_text) or pattern_hybrid_unit.match(args_text) or pattern_hybrid_direct.match(args_text)
     if m_hyb:
         count_str, time_str, unit_str, name_part = m_hyb.groups()
@@ -4285,6 +4468,40 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     # Warm the mute index so the very first incoming message is filtered too.
     mute_cache_rebuild(my_id)
 
+    async def process_gatekeeper_message(event: Any, text: str) -> bool:
+        """Join required channels, mute them, file them and press the check."""
+        if not auto_sub or not is_gatekeeper_message(event.message, text):
+            return False
+        targets, subscribe_coords, verify_coords = gatekeeper_actions(event.message, text)
+        if not targets and not subscribe_coords:
+            return False
+
+        results = []
+        for target in sorted(targets):
+            results.append(await join_and_silence_target(client, target, auto_folder))
+
+        click = getattr(event.message, "click", None)
+        if click is not None:
+            # Some gatekeeper bots expose a callback button instead of a
+            # public URL.  Click all subscription buttons after direct joins;
+            # this also handles a button whose label is "Подписаться 1".
+            for row, col in subscribe_coords:
+                try:
+                    await click(row, col)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log_error(f"[AUTOSUB] Не удалось нажать кнопку подписки {row}:{col}: {type(exc).__name__}")
+            for row, col in verify_coords:
+                try:
+                    await click(row, col)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log_error(f"[AUTOSUB] Не удалось нажать кнопку проверки {row}:{col}: {type(exc).__name__}")
+        return bool(results) and all(results) or bool(subscribe_coords or verify_coords)
+
     @client.on(events.NewMessage(incoming=True))
     async def incoming_handler(event: Any):
         chat_id = event.chat_id
@@ -4313,12 +4530,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         # Counter broadcasts run in the background: a slow media upload must
         # not delay spam clearing or command handling.
+        text = event.raw_text or ""
+        message = event.message
+        gatekeeper = auto_sub and is_gatekeeper_message(message, text)
+        if gatekeeper:
+            # A mandatory-subscription service message is control traffic, not
+            # a real chat message.  It must not consume the user's 15-message
+            # broadcast quota or trigger an unrelated send.
+            await process_gatekeeper_message(event, text)
+            return
         if event.is_private:
             active_broadcaster.on_incoming_message(chat_id)
             return
-
-        text = event.raw_text or ""
-        message = event.message
 
         # Obvious ads reach the read RPC before counter/database work is queued.
         try:
@@ -4345,30 +4568,6 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     note_genuine_ping(my_id, chat_id, msg_id or 0)
         finally:
             active_broadcaster.on_incoming_message(chat_id)
-
-        if auto_sub and is_gatekeeper_text(text):
-            if is_ping or str(my_id) in text:
-                targets = set(extract_channel_links(text))
-                verify_coords = None
-
-                if event.message.reply_markup and hasattr(event.message.reply_markup, "rows"):
-                    for r_idx, row in enumerate(event.message.reply_markup.rows):
-                        for c_idx, button in enumerate(row.buttons):
-                            url = getattr(button, "url", None)
-                            if url:
-                                targets.update(extract_channel_links(url))
-                            btn_text = getattr(button, "text", "")
-                            if is_verify_button(btn_text):
-                                verify_coords = (r_idx, c_idx)
-
-                for target in targets:
-                    await join_and_silence_target(client, target, auto_folder)
-
-                if verify_coords:
-                    try:
-                        await event.message.click(*verify_coords)
-                    except Exception:
-                        pass
 
     @client.on(events.MessageEdited(incoming=True))
     async def edited_spam_handler(event: Any):

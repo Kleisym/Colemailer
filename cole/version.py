@@ -1,3 +1,3 @@
 APP_NAME = "Colemailer"
 APP_SLUG = "colemailer"
-VERSION = "3.4.13"
+VERSION = "3.4.14"
