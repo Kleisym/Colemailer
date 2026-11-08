@@ -127,6 +127,47 @@ def test_gatekeeper_still_runs_in_chat_with_active_broadcast(tmp_db):
     assert event.message.click.await_args_list == [((0, 1), {})]
 
 
+def test_gatekeeper_in_broadcast_folder_is_materialized_before_scheduler_tick(tmp_db):
+    folder_chat = InputPeerChannel(1234, 55)
+    chat_id = bot.utils.get_peer_id(folder_chat)
+    tmp_db.save_template("folder_scope", "text", [], [])
+    tmp_db.register_folder_broadcast(
+        folder_name="автосабнутое",
+        template_name="folder_scope",
+        mode="interval",
+        interval_seconds=900,
+        account_id=MY_ID,
+    )
+    client = FolderClient([NS(
+        id=7,
+        title=TextWithEntities(text="автосабнутое", entities=[]),
+        pinned_peers=[],
+        include_peers=[folder_chat],
+        exclude_peers=[],
+        groups=False,
+        broadcasts=False,
+        contacts=False,
+        non_contacts=False,
+        bots=False,
+        exclude_muted=False,
+        exclude_archived=False,
+    )])
+    handlers = _handlers(client)
+    event = _event(
+        "Kleisym, чтобы писать в чат, необходимо подписаться на канал: @required_channel",
+        mid=93004,
+        chat_id=chat_id,
+        buttons=[NS(text="Подписаться 1", url="https://t.me/required_channel"),
+                 NS(text="Проверить", url=None)],
+    )
+
+    asyncio.run(handlers["incoming_handler"](event))
+
+    assert any(isinstance(req, JoinChannelRequest) for req in client.requests)
+    assert tmp_db.has_active_broadcast(chat_id, account_id=MY_ID)
+    assert event.message.click.await_args_list == [((0, 1), {})]
+
+
 def test_bot_target_never_sends_start_or_auto_mutes(tmp_db):
     client = FolderClient([_folder()], bots={"CryptoBot"})
 

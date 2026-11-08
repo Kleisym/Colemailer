@@ -4555,11 +4555,63 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     # Warm the mute index so the very first incoming message is filtered too.
     mute_cache_rebuild(my_id)
 
+    async def _broadcast_destination(chat_id: Any) -> bool:
+        """Resolve folder destinations before the scheduler's next minute tick.
+
+        Folder broadcasts are persisted in ``folder_broadcasts`` while their
+        per-chat rows are materialised by the scheduler.  A gatekeeper message
+        can arrive in a newly-added folder chat before that materialisation,
+        so checking only ``broadcast_tasks`` made auto-sub silently skip it.
+        """
+        if chat_id is None:
+            return False
+        try:
+            if db.has_active_broadcast(chat_id, account_id=my_id):
+                return True
+        except Exception as exc:
+            log_error(f"[AUTOSUB] Не удалось проверить рассылку чата {chat_id}: {type(exc).__name__}")
+
+        try:
+            folder_broadcasts = db.get_active_folder_broadcasts(account_id=my_id)
+        except Exception as exc:
+            log_error(f"[AUTOSUB] Не удалось прочитать реестр папок: {type(exc).__name__}")
+            return False
+
+        for folder in folder_broadcasts:
+            folder_name = (folder.get("folder_name") or "").strip()
+            template_name = (folder.get("template_name") or "").strip()
+            if not folder_name or not template_name:
+                continue
+            try:
+                live_chats = await get_folder_chats(client, folder_name)
+            except Exception as exc:
+                log_error(f"[AUTOSUB] Не удалось перечитать папку {folder_name!r}: {type(exc).__name__}")
+                continue
+            if live_chats is None or chat_id not in set(live_chats):
+                continue
+
+            # Materialise the row immediately so the same chat is recognised
+            # on the next update and the normal scheduler will send there.
+            try:
+                db.ensure_broadcast_task(
+                    account_id=my_id,
+                    chat_id=chat_id,
+                    template_name=template_name,
+                    mode=folder.get("mode") or "interval",
+                    interval_seconds=folder.get("interval_seconds") or 0,
+                    counter_threshold=folder.get("counter_threshold") or 0,
+                    folder_name=folder_name,
+                )
+            except Exception as exc:
+                log_error(f"[AUTOSUB] Не удалось добавить чат {chat_id} из папки {folder_name!r}: {type(exc).__name__}")
+            return True
+        return False
+
     async def process_gatekeeper_message(event: Any, text: str) -> bool:
         """Join required channels, mute them, file them and press the check."""
         if not auto_sub or not is_gatekeeper_message(event.message, text):
             return False
-        if auto_sub_only_broadcast and not db.has_active_broadcast(event.chat_id, account_id=my_id):
+        if auto_sub_only_broadcast and not await _broadcast_destination(event.chat_id):
             log_info(f"[AUTOSUB] Чат {event.chat_id}: пропуск, активной рассылки нет.")
             return False
         targets, subscribe_coords, verify_coords = gatekeeper_actions(event.message, text)
