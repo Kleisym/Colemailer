@@ -13,10 +13,18 @@ final class AdNotificationFilter {
     private static final Pattern CATALOG = pattern("\\b(?:прайс\\w*|каталог\\w*|отзывы|price\\s*list)\\b");
     private static final Pattern CONTACT = pattern("\\b(?:писать|пишите|пиши|заказать|купить|обращайтесь|контакты|в\\s+лс|в\\s+личку)\\b");
     private static final Pattern PRICE = pattern("\\d+(?:[.,]\\d+)?\\s*(?:\\$|₽|€|руб\\w*|usd|ton|звезд\\w*)|\\$\\s*\\d+");
-    private static final Pattern WATERMARK = pattern("(?:отправлено|передано|переслано|опубликовано|sent|posted)\\s+(?:через|с\\s+помощью|при\\s+помощи|via|through|by)\\s+@[a-z0-9_]{4,32}\\s*$");
+    private static final Pattern WATERMARK = pattern("(?:отправлено|передано|переслано|опубликовано|рассылка|sent|posted)\\s+(?:через|с\\s+помощью|при\\s+помощи|via|through|by)\\s+@[a-z0-9_]{4,32}\\s*$");
     private static final Pattern TARIFF_HEADER = pattern("\\b(?:репост\\w*|размещени\\w*|рассылк\\w*|закреп\\w*)\\s*:");
     private static final Pattern TARIFF_ROW = pattern("(?m)^[\\p{P}\\p{S}\\p{M} \\t]{0,8}\\d+[ \\t]*(?:минут(?:а|ы)?|час(?:а|ов)?|сут(?:ки|ок)|д(?:ень|ня|ней))[ \\t]*[-–—:=][ \\t]*\\d+(?:[.,]\\d+)?[ \\t]*(?:\\$|₽|€|v|ton|руб\\w*|звезд\\w*)?[\\p{P}\\p{S}\\p{M} \\t]*$");
     private static final Pattern AUTH = pattern("(?:my\\.telegram\\.org|login\\s*code|confirmation\\s*code|код\\s+(?:входа|подтверждения))");
+    private static final Pattern RECRUIT = pattern("ищ[уе]\\w*\\s+(?:людей|сотрудник\\w*|работник\\w*)|набор\\s+в\\s+команду");
+    private static final Pattern JOB_DETAIL = pattern("профит|график|обучение\\s*:\\s*бесплатно|трафик|под\\s+процент");
+    private static final Pattern SMM = pattern("\\b(?:клик(?:и|ов)|накрутк\\w*|залив|просмотр(?:ы|ов))\\b");
+    private static final Pattern REFERRAL = pattern("(?:t\\.me|telegram\\.me)/[^\\s]+[?&]startapp=");
+    private static final Pattern GIFT = pattern("nft|нфт|подар(?:ок|ки|ков)");
+    private static final Pattern GIFT_CTA = pattern("бесплатно|хочешь\\s+улучшить|получить\\s+nft");
+    private static final Pattern JOIN_CTA = pattern("\\b(?:присоединяй(?:ся|тесь)|заход(?:и|ите)|вступ(?:ай|айте)|залета(?:й|те))\\b");
+    private static final Pattern DESTINATION = pattern("(?:t\\.me|telegram\\.me)/([a-z0-9_+/-]+)");
 
     private static Pattern pattern(String expression) {
         return Pattern.compile(expression, Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE | Pattern.UNICODE_CHARACTER_CLASS);
@@ -35,6 +43,18 @@ final class AdNotificationFilter {
         boolean catalogue = CATALOG.matcher(text).find();
         boolean routing = CONTACT.matcher(text).find();
         boolean price = PRICE.matcher(text).find();
+        if (contact && RECRUIT.matcher(text).find()) {
+            java.util.regex.Matcher details = JOB_DETAIL.matcher(text);
+            int count = 0;
+            while (details.find()) if (++count >= 2) return true;
+        }
+        if (contact && SMM.matcher(text).find() && price && (routing || WATERMARK.matcher(text).find())) return true;
+        if (contact && REFERRAL.matcher(text).find() && GIFT.matcher(text).find() && GIFT_CTA.matcher(text).find()) return true;
+        if (JOIN_CTA.matcher(text).find()) {
+            java.util.HashSet<String> destinations = new java.util.HashSet<>();
+            java.util.regex.Matcher links = DESTINATION.matcher(text);
+            while (links.find()) if (!destinations.add(links.group(1))) return true;
+        }
         if (contact && TARIFF_HEADER.matcher(text).find()) {
             java.util.regex.Matcher rows = TARIFF_ROW.matcher(text);
             int count = 0;

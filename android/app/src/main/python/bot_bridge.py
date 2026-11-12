@@ -207,6 +207,11 @@ def _install_providers() -> None:
     """Подставить хуки ввода в bot.py (в APK stdin нет)."""
     bot.CODE_PROVIDER = _code_provider
     bot.PASSWORD_PROVIDER = _password_provider
+    # print() goes to logcat, not to the application's visible log ring.
+    # In particular [READ]/[MUTE-NATIVE] errors must reach the screen too.
+    bot.log_error = lambda message: log_line("ERROR", str(message))
+    bot.log_info = lambda message: (
+        log_line("INFO", str(message)) if not bot.CONFIG.get("log_errors_only", True) else None)
 
 
 def install_callback(callback) -> bool:

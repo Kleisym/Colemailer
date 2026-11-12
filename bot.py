@@ -304,7 +304,7 @@ def describe_buttons(rows: Optional[Any]) -> str:
     return describe(rows)
 
 
-_BOT_SYSTEM_MSG_IDS: Set[int] = set()
+_BOT_SYSTEM_MSG_IDS: Set[Tuple[int, int, int]] = set()
 
 def is_internal_bot_message(text: str) -> bool:
     if not text:
@@ -474,6 +474,17 @@ class Database:
                 pass
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_muted_peers_lookup ON muted_peers (account_id, peer_key);")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_muted_peers_unique ON muted_peers (account_id, peer_key);")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS managed_notifications (
+                    account_id INTEGER NOT NULL,
+                    peer_id INTEGER NOT NULL,
+                    input_peer_hex TEXT NOT NULL,
+                    previous_json TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    PRIMARY KEY (account_id, peer_id)
+                )
+            """)
 
             try:
                 cursor.execute("PRAGMA table_info(broadcast_tasks)")
@@ -2341,6 +2352,10 @@ _CONTACT_SECTION_RE = re.compile(
     r"\b(?:купить|заказать|отзывы|обратная\s+связь|для\s+заказа|контакты|reviews|order|contact)\b",
     re.IGNORECASE,
 )
+_JOIN_PROMO_RE = re.compile(
+    r"\b(?:присоединяй(?:ся|тесь)|заход(?:и|ите)|вступ(?:ай|айте)|залета(?:й|йте))\b",
+    re.IGNORECASE,
+)
 
 
 def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str] = None) -> Tuple[int, str, List[str]]:
@@ -2429,6 +2444,12 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     links = _LINK_RE.findall(clean)
     if links:
         add(25 if _PRIVATE_LINK_RE.search(clean) else 10, "promo_links")
+    # Repeated Telegram destinations + an invitation are a broadcast advert,
+    # even if its copy says "no advertisers" and contains no sale verb.
+    destinations = re.findall(r"(?:https?://)?(?:t\.me|telegram\.me)/([a-z0-9_+/-]+)", clean)
+    if (len(destinations) >= 2 and len(set(destinations)) < len(destinations)
+            and _JOIN_PROMO_RE.search(clean)):
+        add(90, "repeated_invite_ad")
     if foreign_handles and commercial_core and not has_text_routing and not has_emoji_routing:
         add(15, "foreign_handle")
     if len(foreign_handles) >= 2:
@@ -2603,6 +2624,8 @@ def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = N
         score, _trigger, factors = calculate_spam_score(text, message)
         labels = {f.split("(", 1)[0] for f in factors}
         catalogue = "seller_price_catalogue" in labels
+        if "repeated_invite_ad" in labels:
+            return True
         sale = bool(labels & {"sale_verb", "seller_ask"})
         contact = bool(labels & {"seller_contact_section", "text_seller_routing",
                                   "emoji_contact_routing", "dm_call_to_action",
@@ -3204,6 +3227,121 @@ async def mute_peer(client: TelegramClient, peer: Any):
         log_error(f"[AUTOSUB] Не удалось заглушить канал/бота: {type(exc).__name__}: {exc}")
         return False
 
+
+async def set_managed_notification_mute(client: TelegramClient, peer_id: int,
+                                         account_id: int, reason: str,
+                                         enabled: bool, quiet: bool = False) -> bool:
+    # Startup migration and a live command may touch the same peer together.
+    # Serialize snapshot/update/restore so neither loses the other's reason.
+    loop = asyncio.get_running_loop()
+    state = getattr(client, "_colemailer_notify_locks", None)
+    if state is None or state[0] is not loop:
+        state = (loop, {})
+        client._colemailer_notify_locks = state
+    lock = state[1].setdefault((account_id, peer_id), asyncio.Lock())
+    async with lock:
+        return await _set_managed_notification_mute(client, peer_id, account_id, reason, enabled, quiet)
+
+
+async def _set_managed_notification_mute(client: TelegramClient, peer_id: int,
+                                          account_id: int, reason: str,
+                                          enabled: bool, quiet: bool) -> bool:
+    """Apply a native Telegram mute, preserving the previous settings on disk.
+
+    A sender mute suppresses mention overrides in already-muted groups. It is
+    not a per-sender exclusion in an unmuted group. Quiet-chat mode deliberately
+    changes the whole chat, not just advertisements.
+    """
+    from telethon.tl.functions.account import GetNotifySettingsRequest
+    from telethon.tl.types import NotificationSoundNone
+
+    try:
+        with db._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM managed_notifications WHERE account_id = ? AND peer_id = ?",
+                (account_id, peer_id),
+            ).fetchone()
+        if row is None and not enabled:
+            return True  # Do not reset a user's own notification preference.
+        if row is not None:
+            input_peer = BinaryReader(bytes.fromhex(row["input_peer_hex"])).tgread_object()
+            previous = json.loads(row["previous_json"])
+            reasons = set(json.loads(row["reasons_json"]))
+        else:
+            input_peer = await asyncio.wait_for(client.get_input_entity(peer_id), READ_RPC_TIMEOUT)
+            original = await asyncio.wait_for(
+                client(GetNotifySettingsRequest(peer=InputNotifyPeer(input_peer))), READ_RPC_TIMEOUT)
+            from telethon.tl.types import PeerNotifySettings
+            if not isinstance(original, PeerNotifySettings):
+                raise RuntimeError("notification settings missing")
+            until = getattr(original, "mute_until", None)
+            previous = {"mute_until": int(until.timestamp()) if hasattr(until, "timestamp") else until}
+            for field in ("show_previews", "silent", "stories_muted", "stories_hide_sender"):
+                previous[field] = getattr(original, field, None)
+            for key, field in (("sound", "other_sound"), ("stories_sound", "stories_other_sound")):
+                sound = getattr(original, field, None)
+                previous[key] = bytes(sound).hex() if sound is not None else None
+            reasons = set()
+        if enabled:
+            reasons.add(reason)
+        else:
+            reasons.discard(reason)
+        if reasons:
+            # Keep the snapshot before the RPC: a disconnect after submission
+            # must still leave enough state for .размутить / .тишина выкл.
+            with db._conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO managed_notifications VALUES (?, ?, ?, ?, ?)",
+                    (account_id, peer_id, bytes(input_peer).hex(),
+                     json.dumps(previous), json.dumps(sorted(reasons))),
+                )
+            values = dict(previous)
+            for field in ("sound", "stories_sound"):
+                raw = values.get(field)
+                values[field] = BinaryReader(bytes.fromhex(raw)).tgread_object() if raw else None
+            values["mute_until"] = 2147483647
+            if quiet or reasons & {"quiet_chat", "mute_chat"}:
+                values["sound"] = NotificationSoundNone()
+        else:
+            values = dict(previous)
+            for field in ("sound", "stories_sound"):
+                raw = values.get(field)
+                values[field] = BinaryReader(bytes.fromhex(raw)).tgread_object() if raw else None
+        result = await asyncio.wait_for(client(UpdateNotifySettingsRequest(
+            peer=InputNotifyPeer(input_peer), settings=InputPeerNotifySettings(**values))), READ_RPC_TIMEOUT)
+        if result is not True:
+            raise RuntimeError("notification update returned False")
+        if not reasons:
+            with db._conn() as conn:
+                conn.execute("DELETE FROM managed_notifications WHERE account_id = ? AND peer_id = ?",
+                             (account_id, peer_id))
+        elif not enabled:
+            with db._conn() as conn:
+                conn.execute("UPDATE managed_notifications SET reasons_json = ? WHERE account_id = ? AND peer_id = ?",
+                             (json.dumps(sorted(reasons)), account_id, peer_id))
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_error(f"[MUTE-NATIVE] peer={peer_id}: {type(exc).__name__}")
+        return False
+
+
+async def sync_saved_native_mutes(client: TelegramClient, account_id: int):
+    """Upgrade existing global/chat mutes too, not just new .мутить commands."""
+    for row in db.list_muted_peers(account_id=account_id):
+        chat_scope = row.get("scope") == "chat"
+        if not chat_scope and int(row.get("chat_id") or 0):
+            continue  # Telegram has no per-sender mute scoped to one group.
+        peer_id = int(row.get("peer_id") or row["peer_key"])
+        if not await set_managed_notification_mute(
+                client, peer_id, account_id, "mute_chat" if chat_scope else "mute_user",
+                True, quiet=chat_scope):
+            # Stop a failing batch instead of generating dozens of identical
+            # flood/connection failures while the account is rate-limited.
+            break
+        await asyncio.sleep(0.1)
+
 async def add_peer_to_folder(client: TelegramClient, folder_name: str, peer: Any):
     try:
         input_peer = await client.get_input_entity(peer)
@@ -3409,11 +3547,9 @@ async def _safe_to_read_ad_history(client: TelegramClient, input_peer: Any, msg_
         for item in previous:
             if getattr(item, "out", False):
                 continue
-            if getattr(item, "mentioned", False):
-                return False  # Preserve unknown genuine pings across restarts.
             body = getattr(item, "message", "") or ""
             if not should_auto_read(body, item, is_ping=False):
-                return False
+                return False  # Includes genuine/unknown mentions, never read them.
         return True
     except Exception as exc:
         log_info(f"[ANTISPAM] История не тронута: не удалось проверить непрочитанные ({type(exc).__name__}).")
@@ -3501,20 +3637,104 @@ _MUTE_WARN_COOLDOWN: Dict[Tuple[int, int], float] = {}
 
 
 READ_RPC_TIMEOUT = 3.0
+READ_BATCH_DELAY = 0.01
+
+
+class _ReadReceiptBatcher:
+    """Merge a burst of receipts; independent contents/history RPCs stay parallel."""
+    def __init__(self, client: TelegramClient):
+        self.client = client
+        self.loop = asyncio.get_running_loop()
+        self.pending: Dict[Any, Any] = {}
+
+    async def request(self, request: Any, chat_id: Any):
+        peer = getattr(request, "channel", None) or getattr(request, "peer", None)
+        try:
+            address = bytes(peer) if peer is not None else str(chat_id)
+        except (TypeError, AttributeError):
+            address = str(chat_id)
+        key = (type(request), address)
+        future = self.loop.create_future()
+        group = self.pending.get(key)
+        if group is None:
+            group = [copy.copy(request), []]
+            self.pending[key] = group
+            self.loop.create_task(self._flush(key, group))
+        merged, waiters = group
+        if hasattr(request, "id"):
+            merged.id = sorted(set(merged.id) | set(request.id))
+        else:
+            merged.max_id = max(merged.max_id, request.max_id)
+        waiters.append(future)
+        return await future
+
+    async def _flush(self, key: Any, group: Any):
+        try:
+            await asyncio.sleep(READ_BATCH_DELAY)
+            self.pending.pop(key, None)
+            request, waiters = group
+            if all(f.done() for f in waiters):
+                return
+            # Telegram accepts a vector of ids; bound it even under heavy load.
+            chunks = [request]
+            if hasattr(request, "id") and len(request.id) > 100:
+                chunks = []
+                for offset in range(0, len(request.id), 100):
+                    part = copy.copy(request)
+                    part.id = request.id[offset:offset + 100]
+                    chunks.append(part)
+            for part in chunks:
+                operation = (self.client(part, flood_sleep_threshold=0)
+                             if isinstance(self.client, TelegramClient) else self.client(part))
+                result = await asyncio.wait_for(operation, timeout=READ_RPC_TIMEOUT)
+                if result is False:
+                    raise RuntimeError("Telegram returned False")
+            for future in waiters:
+                if not future.done():
+                    future.set_result(True)
+        except (Exception, asyncio.CancelledError) as exc:
+            if self.pending.get(key) is group:
+                self.pending.pop(key, None)
+            for future in group[1]:
+                if not future.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        future.cancel()
+                    else:
+                        future.set_exception(exc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+
+def _read_status(client: Any, stage: str, chat_id: Any, ok: bool, reason: str = ""):
+    status = getattr(client, "_colemailer_read_status", None)
+    if status is None:
+        status = {}
+        client._colemailer_read_status = status
+    status[(chat_id, stage)] = (time.time(), ok, reason)
+    if len(status) > 2000:
+        status.pop(next(iter(status)))
 
 
 async def _read_rpc(client: TelegramClient, request: Any, stage: str,
                     chat_id: Any, msg_id: int) -> bool:
     """Bound each independent read RPC; report failures in errors-only mode."""
     try:
-        result = await asyncio.wait_for(client(request), timeout=READ_RPC_TIMEOUT)
+        batcher = getattr(client, "_colemailer_read_batcher", None)
+        if batcher is None or batcher.loop is not asyncio.get_running_loop():
+            batcher = _ReadReceiptBatcher(client)
+            client._colemailer_read_batcher = batcher
+        result = await asyncio.wait_for(batcher.request(request, chat_id), timeout=READ_RPC_TIMEOUT)
         if result is not False:
+            _read_status(client, stage, chat_id, True)
             return True
         reason = "Telegram вернул False"
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         reason = type(exc).__name__
+        if isinstance(exc, errors.FloodWaitError):
+            reason += f" wait={exc.seconds}s"
+    _read_status(client, stage, chat_id, False, reason)
     log_error(f"[READ] {stage}: чат {chat_id}, сообщение {msg_id}: {reason}")
     return False
 
@@ -3569,6 +3789,47 @@ async def mark_message_read(client: TelegramClient, chat_peer: Any, message: Any
         _read_rpc(client, history, "readHistory", chat_id, msg_id),
     )
     return all(results)
+
+
+async def cleanup_spam_mentions(client: TelegramClient, chat_peer: Any,
+                                account_id: int, chat_id: int) -> Dict[str, Any]:
+    """Clear at most 100 old ad/mute mentions, never the whole mention list."""
+    from telethon.tl.functions.messages import GetUnreadMentionsRequest
+    from telethon.tl.functions.messages import ReadMessageContentsRequest as MessageContents
+    from telethon.tl.functions.channels import ReadMessageContentsRequest as ChannelContents
+    from telethon.tl.types import InputPeerChannel
+    result = {"ok": False, "cleared": 0, "kept": 0}
+    try:
+        peer = await asyncio.wait_for(_resolve_input_peer(client, chat_peer, None), READ_RPC_TIMEOUT)
+        if peer is None:
+            return result
+        response = await asyncio.wait_for(client(GetUnreadMentionsRequest(
+            peer=peer, offset_id=0, add_offset=0, limit=100, max_id=0, min_id=0)), READ_RPC_TIMEOUT)
+        messages = getattr(response, "messages", None)
+        if messages is None:
+            return result
+        ids = []
+        for message in messages[:100]:
+            mid = getattr(message, "id", 0)
+            body = getattr(message, "message", "") or ""
+            action = mute_action_for(account_id, _message_sender_id(message), chat_id)
+            if mid and not getattr(message, "out", False) and (
+                    action or should_auto_read(body, message, is_ping=False)):
+                ids.append(mid)
+            else:
+                result["kept"] += 1
+        if ids:
+            request = (ChannelContents(channel=utils.get_input_channel(peer), id=sorted(set(ids)))
+                       if isinstance(peer, InputPeerChannel) else MessageContents(id=sorted(set(ids))))
+            if not await _read_rpc(client, request, "cleanupContents", chat_id, max(ids)):
+                return result
+        result.update(ok=True, cleared=len(set(ids)))
+        return result
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_error(f"[READ] cleanup chat={chat_id}: {type(exc).__name__}")
+        return result
 
 
 async def apply_mute_action(
@@ -4139,7 +4400,9 @@ HELP_TEXT = """
 • `.мутить @username бан` — снимает право писать (нужны права админа)
 • `.мутить чат` — тишина во всём этом чате
 • `.размутить @username` / `.размутить @username тут` / `.размутить чат` / `.заглушенные`
-*(Мьюты переживают перезапуск, работают для текста, медиа, стикеров и правок)*
+• `.очиститьпинги` — снять до 100 старых рекламных/заглушённых упоминаний, не читая обычную историю
+• `.тишина` / `.тишина выкл` — нативный мьют и звук «Нет» всего чата / вернуть прежние настройки
+*(Глобальный мьют автора действует и в ЛС Telegram; локальный «тут» — только фильтр Colemailer. Упоминания могут обходить мьют группы. Уже сыгравший звук чтением не отменяется.)*
 
 **10. Кнопки под постом:**
 • `.кнопки <название>` — пришли раскладку одним сообщением, одна строка = один ряд:
@@ -4154,7 +4417,7 @@ HELP_TEXT = """
 
 **12. Служебное:**
 • `.версия` — версия бота
-• `.пингдиаг` — ответом на сообщение: показать распознавание рекламы, адресата и мьют, не читая историю
+• `.пингдиаг` — ответом: реклама, адресат, мьют и результат последних запросов чтения; историю не читает
 • `.рассылки` — все рассылки аккаунта
 • `.синк` — перечитать папки и подхватить новые чаты сразу
 """
@@ -4360,6 +4623,14 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
 
 _BG_NOTIFY_TASKS: Set["asyncio.Future"] = set()
 
+def _system_message_key(event: Any, msg_id: Optional[int] = None) -> Tuple[int, int, int]:
+    # Message ids are unique inside a channel, not across Telegram chats.
+    client = getattr(event, "client", None)
+    owner = getattr(getattr(client, "_colemailer_broadcaster", None), "account_id", 0)
+    return (int(owner or getattr(event, "sender_id", None) or 0),
+            int(getattr(event, "chat_id", None) or 0),
+            int(msg_id if msg_id is not None else getattr(event, "id", 0) or 0))
+
 async def _notify(event: Any, text: str, auto_delete: int = 5, force_respond: bool = False):
     msg = None
     try:
@@ -4374,7 +4645,7 @@ async def _notify(event: Any, text: str, auto_delete: int = 5, force_respond: bo
             log_error(f"[ERROR] Ошибка отправки ответа на команду: {e}")
 
     if msg and hasattr(msg, "id"):
-        _BOT_SYSTEM_MSG_IDS.add(msg.id)
+        _BOT_SYSTEM_MSG_IDS.add(_system_message_key(event, msg.id))
         if len(_BOT_SYSTEM_MSG_IDS) > 2000:
             try:
                 _BOT_SYSTEM_MSG_IDS.pop()
@@ -4554,6 +4825,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
     # Warm the mute index so the very first incoming message is filtered too.
     mute_cache_rebuild(my_id)
+    try:
+        task = asyncio.get_running_loop().create_task(sync_saved_native_mutes(client, my_id))
+        if hasattr(broadcaster, "_bg_tasks"):
+            broadcaster._bg_tasks.add(task)
+            task.add_done_callback(broadcaster._bg_tasks.discard)
+    except RuntimeError:
+        pass  # Offline registration/tests: no event loop is running yet.
 
     async def _broadcast_destination(chat_id: Any) -> bool:
         """Resolve folder destinations before the scheduler's next minute tick.
@@ -4765,13 +5043,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             return
 
         msg_id = getattr(event, "id", None)
-        if msg_id and msg_id in _BOT_SYSTEM_MSG_IDS:
+        if msg_id and _system_message_key(event, msg_id) in _BOT_SYSTEM_MSG_IDS:
             return
 
         raw = event.raw_text or ""
         if is_internal_bot_message(raw):
             if msg_id:
-                _BOT_SYSTEM_MSG_IDS.add(msg_id)
+                _BOT_SYSTEM_MSG_IDS.add(_system_message_key(event, msg_id))
             return
 
         chat_id = event.chat_id
@@ -4820,7 +5098,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     ".размутить", ".размут", ".unmute", ".unignore",
                     ".заглушенные", ".мутлист", ".mutelist", ".рассылки", ".broadcasts",
                     ".кнопки", ".buttons", ".превью", ".preview",
-                    ".синк", ".sync", ".версия", ".version", ".пингдиаг", ".pingdiag"
+                    ".синк", ".sync", ".версия", ".version", ".пингдиаг", ".pingdiag",
+                    ".тишина", ".quiet", ".очиститьпинги", ".clearpings"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -4849,6 +5128,24 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         if cmd in (".пингдиаг", ".pingdiag"):
             await handle_ping_diagnostic(event)
+            return
+
+        if cmd in (".тишина", ".quiet"):
+            disabled = len(parts) > 1 and parts[1].lower() in ("выкл", "off", "0")
+            ok = await set_managed_notification_mute(client, event.chat_id, my_id,
+                                                      "quiet_chat", not disabled, quiet=not disabled)
+            text = ("🔕 Для всего чата: мьют навсегда и звук «Нет». Переписка не прочитана. "
+                    "Упоминания могут обходить мьют группы; авторов рекламы глушите .мутить."
+                    if not disabled else "🔊 Прежние настройки уведомлений восстановлены.")
+            await _notify(event, text if ok else "Ошибка настройки уведомлений: [MUTE-NATIVE] в логе.", auto_delete=0)
+            return
+
+        if cmd in (".очиститьпинги", ".clearpings"):
+            result = await cleanup_spam_mentions(client, getattr(event, "input_chat", None) or event.chat_id,
+                                                  my_id, event.chat_id)
+            await _notify(event, (f"🧹 Пинги рекламы/мьюта: снято {result['cleared']}; оставлено {result['kept']}. "
+                                  "История и обычные сообщения не прочитаны (проверено до 100 упоминаний).")
+                           if result["ok"] else "Очистка пингов завершилась ошибкой; [READ] в логе.", auto_delete=0)
             return
 
         if cmd in (".рассыл", ".broadcast"):
@@ -5006,13 +5303,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
     async def collect_message_to_session(event: Any, session: Dict[str, Any]):
         msg = event.message
-        if getattr(msg, "id", None) in _BOT_SYSTEM_MSG_IDS:
+        if _system_message_key(event, getattr(msg, "id", None)) in _BOT_SYSTEM_MSG_IDS:
             return
 
         text = msg.raw_text or ""
         if is_internal_bot_message(text):
             if hasattr(msg, "id"):
-                _BOT_SYSTEM_MSG_IDS.add(msg.id)
+                _BOT_SYSTEM_MSG_IDS.add(_system_message_key(event, msg.id))
             return
 
         if session.get("session_type") == "buttons":
@@ -5552,6 +5849,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         action = mute_action_for(my_id, sender, source_chat)
         decision = f"мьют {action}" if action else (
             "антиспам" if is_ad and auto_read_spam and not is_private else "пропуск")
+        recent = []
+        for (cid, stage), (stamp, ok, reason) in getattr(client, "_colemailer_read_status", {}).items():
+            if cid == source_chat:
+                recent.append(f"{stage}: {'ok' if ok else reason}, {int(time.time() - stamp)}с назад")
         await _notify(
             event,
             f"{APP_NAME} {APP_VERSION}\n"
@@ -5561,6 +5862,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             f"Мьют: {action or 'нет'}; область: {mute_scope_for(my_id, sender, source_chat) or 'нет'}\n"
             f"Адресный пинг: {kind or 'нет'}; Telegram mentioned: {bool(getattr(reply, 'mentioned', False))}\n"
             f"Антиспам аккаунта: {'вкл' if auto_read_spam else 'выкл'}\n"
+            f"Последние запросы чтения чата: {'; '.join(recent) or 'нет в этом запуске'}\n"
             f"Ожидаемое действие: {decision}. Диагностика историю не читает.",
             auto_delete=0,
         )
@@ -5748,6 +6050,16 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             current_read = await apply_mute_action(
                 client, reply_message, my_id, event.chat_id, action,
                 chat_peer=getattr(event, "input_chat", None))
+        native_result = None
+        if target["scope"] == "chat" or not mute_chat:
+            native_result = await set_managed_notification_mute(
+                client, target["peer_id"], my_id,
+                "mute_chat" if target["scope"] == "chat" else "mute_user", True,
+                quiet=target["scope"] == "chat")
+        cleanup = None
+        if reply_message is not None and not cross_chat_reply:
+            cleanup = await cleanup_spam_mentions(client, getattr(event, "input_chat", None) or event.chat_id,
+                                                   my_id, event.chat_id)
         verb = "Заглушен" if added else "Обновлён мьют"
         action_hint = {
             "silent": "сообщения помечаются прочитанными, пинг снимается",
@@ -5769,6 +6081,16 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             current_hint = "\nМьют сохранён, но снять текущий пинг не удалось. Подробности: [READ] в логе Colemailer."
         elif cross_chat_reply:
             current_hint = "\nЦитата другого чата: текущий чат не помечен прочитанным."
+        if native_result is True:
+            current_hint += ("\nTelegram: мьют всего чата и звук отключены заранее."
+                             if target["scope"] == "chat" else
+                             "\nTelegram: мьют автора включён (ЛС и пинги в уже заглушённых группах).")
+        elif native_result is False:
+            current_hint += "\nНативный мьют не применён: [MUTE-NATIVE] в логе; фильтр чтения сохранён."
+        if target["scope"] != "chat":
+            current_hint += "\nВ незаглушённой группе Telegram может показать push раньше обработки. Для всего чата: .тишина."
+        if cleanup and cleanup["ok"]:
+            current_hint += f"\nСтарые рекламные/заглушённые пинги: снято {cleanup['cleared']}."
         await _notify(
             event,
             f"🔇 {verb}: **{target['display_name']}**\n"
@@ -5779,17 +6101,19 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     async def handle_unmute(event: Any, raw: str):
         _, args = _extract_quoted_folder(raw)
         args_clean = _strip_command_word(args).strip()
-        if not args_clean:
+        if not args_clean and not event.is_reply:
             await _notify(event, "⚠️ Укажите @username или id, либо ответьте командой на сообщение.")
             return
 
         if args_clean.lower() in ("чат", "chat", "беседа"):
             removed = db.remove_muted_peer(event.chat_id, account_id=my_id, scope="chat")
             mute_cache_rebuild(my_id)
+            restored = await set_managed_notification_mute(client, event.chat_id, my_id, "mute_chat", False)
             if removed:
-                await _notify(event, "🔊 Чат разглушен.")
+                await _notify(event, "🔊 Чат разглушен." + ("" if restored else " Ошибка восстановления уведомлений: [MUTE-NATIVE]."))
             else:
-                await _notify(event, "ℹ️ Этот чат не был заглушен.")
+                await _notify(event, "ℹ️ Этот чат не был в списке заглушенных." +
+                              ("" if restored else " Ошибка восстановления уведомлений: [MUTE-NATIVE]."))
             return
 
         words = args_clean.split()
@@ -5797,7 +6121,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         args_clean = " ".join(w for w in words if w.lower() not in ("тут", "здесь", "here", "локально")).strip()
         mute_chat = int(event.chat_id or 0) if here_only else None
 
-        target = await _resolve_mute_target(event, args_clean) if args_clean else None
+        target = await _resolve_mute_target(event, args_clean) if args_clean or event.is_reply else None
         if target:
             removed = db.remove_muted_peer(
                 target["peer_key"], account_id=my_id, scope=target["scope"], chat_id=mute_chat
@@ -5811,17 +6135,22 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     scope=found.get("scope") or "user",
                     chat_id=mute_chat,
                 )
-                target = {"display_name": found.get("display_name") or f"@{token}"}
+                target = dict(found, display_name=found.get("display_name") or f"@{token}")
             else:
                 removed = 0
                 target = {"display_name": token or "этот человек"}
 
         mute_cache_rebuild(my_id)
+        restored = True
+        if target and "peer_key" in target and not here_only:
+            restored = await set_managed_notification_mute(client, target.get("peer_id", target["peer_key"]),
+                                                           my_id, "mute_user", False)
         where = " в этом чате" if here_only else ""
+        native_hint = "" if restored else " Ошибка восстановления уведомлений: [MUTE-NATIVE]. Повторите команду."
         if removed:
-            await _notify(event, f"🔊 Разглушен{where}: **{target['display_name']}**")
+            await _notify(event, f"🔊 Разглушен{where}: **{target['display_name']}**{native_hint}")
         else:
-            await _notify(event, f"ℹ️ **{target['display_name']}** не был в списке заглушенных{where}.")
+            await _notify(event, f"ℹ️ **{target['display_name']}** не был в списке заглушенных{where}.{native_hint}")
 
     async def handle_mute_list(event: Any):
         rows = db.list_muted_peers(account_id=my_id)

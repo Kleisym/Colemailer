@@ -139,7 +139,6 @@ def test_single_unread_ad_can_clear_history(peer):
 @pytest.mark.parametrize('previous', [
     [NS(message='Привет, ответь пожалуйста', out=False, mentioned=False)],
     [NS(message='почем реклама?', out=False, mentioned=True)],
-    [NS(message=SCREENSHOT_AD, out=False, mentioned=True)],
     [NS(message='', out=False, mentioned=False)],
     [NS(message=SCREENSHOT_AD, out=False), NS(message='оплатил', out=False)],
 ])
@@ -149,8 +148,9 @@ def test_unread_conversation_survives_even_after_restart(previous):
     assert 'ReadHistoryRequest' not in client.calls
 
 
-def test_only_unread_ads_can_clear_history():
-    client = ClearClient(previous=[NS(message=SCREENSHOT_AD, out=False, mentioned=False)])
+@pytest.mark.parametrize('mentioned', [False, True])
+def test_only_unread_ads_can_clear_history(mentioned):
+    client = ClearClient(previous=[NS(message=SCREENSHOT_AD, out=False, mentioned=mentioned)])
     clear(client)
     assert 'ReadHistoryRequest' in client.calls
 
