@@ -130,7 +130,8 @@ def test_failed_current_read_is_reported_not_claimed_as_silenced(tmp_db):
 
 
 def test_slow_contents_rpc_does_not_delay_history_read(monkeypatch):
-    monkeypatch.setattr(bot, 'READ_RPC_TIMEOUT', 0.03, raising=False)
+    monkeypatch.setattr(bot, 'READ_BATCH_DELAY', 0.001, raising=False)
+    monkeypatch.setattr(bot, 'READ_RPC_TIMEOUT', 0.15, raising=False)
     history_sent = asyncio.Event()
     concurrent_history = []
 
@@ -169,7 +170,8 @@ def test_read_rpc_false_is_a_failure_not_success():
 
 
 def test_ad_clearing_does_not_await_contents_before_sending_history(monkeypatch):
-    monkeypatch.setattr(bot, 'READ_RPC_TIMEOUT', 0.03, raising=False)
+    monkeypatch.setattr(bot, 'READ_BATCH_DELAY', 0.001, raising=False)
+    monkeypatch.setattr(bot, 'READ_RPC_TIMEOUT', 0.15, raising=False)
     history_sent = asyncio.Event()
     concurrent = []
 
