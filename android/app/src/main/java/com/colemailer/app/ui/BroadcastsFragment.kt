@@ -11,7 +11,6 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import com.colemailer.app.BotService
 import com.colemailer.app.PythonBridge
 import com.colemailer.app.R
 import com.google.android.material.button.MaterialButton
@@ -49,15 +48,17 @@ class BroadcastsFragment : Fragment(R.layout.fragment_broadcasts) {
         load()
     }
 
+    override fun onResume() {
+        super.onResume()
+        load()
+    }
+
     private fun load() {
         val context = requireContext().applicationContext
-        if (!BotService.isRunning() && !PythonBridge.isAlive) {
-            tvStatus.text = getString(R.string.broadcasts_not_ready)
-            return
-        }
         viewLifecycleOwner.lifecycleScope.launch {
             val json: JSONObject? = withContext(Dispatchers.IO) {
-                PythonBridge.tasks()
+                PythonBridge.ensureStarted(context)
+                PythonBridge.tasks(context)
             }
             if (json == null) {
                 tvStatus.text = getString(R.string.broadcasts_not_ready)
@@ -80,8 +81,13 @@ class BroadcastsFragment : Fragment(R.layout.fragment_broadcasts) {
                     val template = item.optString("template").ifBlank { "шаблон" }
                     val chat = item.optString("chat_id")
                     val nextAt = item.optDouble("next_at", 0.0)
+                    val count = item.optInt("count", 0)
+                    val threshold = item.optInt("threshold", 0)
                     val subtitle = buildString {
                         append(getString(R.string.item_task_chat, chat))
+                        if (threshold > 0) {
+                            append(" · $count/$threshold")
+                        }
                         if (nextAt > 0.0) {
                             append(" · ")
                             append(getString(R.string.item_task_next, clock.format(Date((nextAt * 1000).toLong()))))

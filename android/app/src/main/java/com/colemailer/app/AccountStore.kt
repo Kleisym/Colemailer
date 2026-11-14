@@ -102,10 +102,14 @@ object AccountStore {
     }
 
     fun select(context: Context, account: Account) {
+        val changed = Prefs.activeAccountId != account.id
         Prefs.activeAccountId = account.id
         Prefs.apiId = account.apiId
         Prefs.apiHash = account.apiHash
         Prefs.phone = account.phone
         Prefs.password2fa = account.password
+        if (changed) {
+            Prefs.user = ""
+        }
     }
 }

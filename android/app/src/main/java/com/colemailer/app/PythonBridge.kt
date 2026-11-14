@@ -49,7 +49,8 @@ object PythonBridge {
                         Prefs.phone,
                         Prefs.password2fa,
                         appContext.filesDir.absolutePath,
-                        callback
+                        callback,
+                        Prefs.activeAccountId
                     )
                 } catch (t: Throwable) {
                     val message = t.message ?: t.javaClass.simpleName
@@ -82,7 +83,11 @@ object PythonBridge {
      * Блокирующая — вызывать из Dispatchers.IO.
      */
     fun ensureStarted(context: Context) {
-        runCatching { bridgeModule(context.applicationContext) }
+        val appContext = context.applicationContext
+        runCatching {
+            val bridge = bridgeModule(appContext)
+            bridge.callAttr("init_storage", appContext.filesDir.absolutePath)
+        }
     }
 
     fun stop() {
@@ -97,6 +102,9 @@ object PythonBridge {
     fun state(): JSONObject? = callJson("get_state_json")
 
     fun tasks(): JSONObject? = callJson("get_tasks_json")
+
+    fun tasks(context: Context): JSONObject? =
+        callJson("get_tasks_json", context.applicationContext.filesDir.absolutePath)
 
     fun settings(): JSONObject? = callJson("get_settings_json")
 

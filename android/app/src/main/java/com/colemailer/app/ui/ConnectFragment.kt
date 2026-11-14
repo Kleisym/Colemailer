@@ -186,13 +186,17 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
 
     private fun addAccount() {
         saveCurrent()
+        var index = accounts.size + 1
+        while (accounts.any { it.name == getString(R.string.account_new_name, index) }) {
+            index++
+        }
         val account = Account(
             id = UUID.randomUUID().toString(),
-            name = getString(R.string.account_new_name, accounts.size + 1),
-            apiId = etApiId.text?.toString()?.trim().orEmpty(),
-            apiHash = etApiHash.text?.toString()?.trim().orEmpty(),
-            phone = etPhone.text?.toString()?.trim().orEmpty(),
-            password = etPassword.text?.toString()?.trim().orEmpty()
+            name = getString(R.string.account_new_name, index),
+            apiId = "",
+            apiHash = "",
+            phone = "",
+            password = ""
         )
         accounts.add(account)
         currentId = account.id
@@ -232,7 +236,13 @@ class ConnectFragment : Fragment(R.layout.fragment_connect) {
         val phone = etPhone.text?.toString()?.trim().orEmpty().replace(" ", "").replace("-", "")
         val password = etPassword.text?.toString()?.trim().orEmpty()
 
-        if (apiId.isEmpty() || !Regex("^[0-9a-fA-F]{32}$").matches(apiHash)) {
+        val apiIdInt = apiId.toIntOrNull()
+        if (apiIdInt == null || apiIdInt <= 0) {
+            setStatus(getString(R.string.toast_bad_api_id), false)
+            toast(getString(R.string.toast_bad_api_id))
+            return
+        }
+        if (!Regex("^[0-9a-fA-F]{32}$").matches(apiHash)) {
             setStatus(getString(R.string.toast_bad_hash), false)
             toast(getString(R.string.toast_bad_hash))
             return

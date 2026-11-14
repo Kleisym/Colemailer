@@ -157,6 +157,7 @@
     <!-- Тосты и сообщения -->
     <string name="toast_need_keys">Сначала заполните api_id и api_hash</string>
     <string name="toast_need_phone">Укажите номер телефона</string>
+    <string name="toast_bad_api_id">api_id должен быть положительным числом</string>
     <string name="toast_bad_hash">api_hash должен быть 32 символа: 0-9, a-f</string>
     <string name="toast_bad_phone">Номер должен быть в формате +79991234567</string>
     <string name="toast_saved">Сохранено</string>

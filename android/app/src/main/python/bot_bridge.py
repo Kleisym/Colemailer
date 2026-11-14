@@ -26,6 +26,7 @@ import json
 import os
 import random
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -228,6 +229,41 @@ def install_callback(callback) -> bool:
 
 
 # ------------------------------------------------------------------- хранилище
+def init_storage(app_dir: str) -> bool:
+    """Явно инициализировать каталог приложения (для экранов до первого старта)."""
+    _ensure_storage(str(app_dir or "").strip())
+    return True
+
+
+def _session_name(app_dir: str, session_id_val: str = "", phone: str = "") -> str:
+    """Отдельный .session-файл на аккаунт, с бережным переносом legacy-файла."""
+    raw_id = str(session_id_val or "").strip()
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_id).strip("_.")
+    if not safe_id and phone:
+        safe_id = "phone_" + hashlib.sha256(phone.encode("utf-8")).hexdigest()[:12]
+    if not safe_id:
+        return SESSION_NAME
+
+    target = "%s_%s" % (SESSION_NAME, safe_id)
+    target_file = os.path.join(app_dir, target + ".session")
+    legacy_file = os.path.join(app_dir, SESSION_NAME + ".session")
+    if app_dir and os.path.exists(legacy_file) and not os.path.exists(target_file):
+        try:
+            has_per_account = any(
+                name.startswith(SESSION_NAME + "_") and name.endswith(".session")
+                for name in os.listdir(app_dir)
+            )
+            if not has_per_account:
+                for ext in (".session", ".session-journal", ".session-wal", ".session-shm"):
+                    src = os.path.join(app_dir, SESSION_NAME + ext)
+                    dst = os.path.join(app_dir, target + ext)
+                    if os.path.exists(src) and not os.path.exists(dst):
+                        shutil.move(src, dst)
+        except Exception:
+            pass
+    return target
+
+
 def _ensure_storage(app_dir: str) -> None:
     """Один раз инициализировать каталог приложения для bot.py."""
     global _storage_ready
@@ -356,6 +392,35 @@ def _num(value) -> Optional[float]:
     return None
 
 
+def _active_account_id() -> int:
+    try:
+        return int(getattr(_broadcaster, "account_id", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _task_next_at(task: Dict[str, Any], now: float) -> float:
+    for key in ("next_at", "next_run_at", "due_at"):
+        explicit = _num(task.get(key))
+        if explicit is not None:
+            return explicit
+    retry_at = float(task.get("retry_at") or 0.0)
+    if retry_at > 0:
+        return max(now, retry_at)
+    mode = str(task.get("mode") or "interval")
+    interval = int(task.get("interval_seconds") or 0)
+    if mode not in ("interval", "hybrid") or interval <= 0:
+        return 0.0
+    if mode == "hybrid":
+        threshold = max(int(task.get("counter_threshold") or 0), 1)
+        if int(task.get("current_count") or 0) < threshold:
+            return 0.0
+    last_sent = float(task.get("last_sent_at") or 0.0)
+    if last_sent <= 0:
+        return now
+    return max(now, last_sent + interval)
+
+
 def _compute_next_due(broadcaster=None) -> Optional[int]:
     """Когда просыпаться для следующей рассылки/ретрая (epoch ms)."""
     getter = getattr(broadcaster, "next_due_ms", None)
@@ -371,13 +436,20 @@ def _compute_next_due(broadcaster=None) -> Optional[int]:
     if db is None:
         return None
 
+    account_id = 0
+    try:
+        account_id = int(getattr(broadcaster, "account_id", 0) or 0)
+    except Exception:
+        account_id = 0
+
+    now = time.time()
     candidates: List[float] = []
     for name in ("next_due_at", "next_retry_at", "next_task_at"):
         fn = getattr(db, name, None)
         if not callable(fn):
             continue
         value = None
-        for call in (lambda: fn(account_id=0), lambda: fn()):
+        for call in (lambda: fn(account_id=account_id), lambda: fn()):
             try:
                 value = call()
                 break
@@ -388,19 +460,17 @@ def _compute_next_due(broadcaster=None) -> Optional[int]:
                 break
         number = _num(value)
         if number is not None:
-            candidates.append(number)
+            candidates.append(max(now, number) if number < 1e11 else number)
 
     lister = getattr(db, "get_active_interval_tasks", None)
     if callable(lister):
         try:
-            for task in lister(account_id=0) or []:
+            for task in lister(account_id=account_id) or []:
                 if not isinstance(task, dict):
                     continue
-                for key in ("next_at", "next_run_at", "due_at"):
-                    number = _num(task.get(key))
-                    if number is not None:
-                        candidates.append(number)
-                        break
+                due = _task_next_at(task, now)
+                if due > 0:
+                    candidates.append(due)
         except Exception:
             pass
 
@@ -516,6 +586,7 @@ def _account_cfg(username: str) -> Dict[str, Any]:
         "auto_sub_folder": cfg.get("auto_sub_folder", "автосабнутое"),
         "auto_read_spam_pings": bool(cfg.get("auto_read_spam_pings", True)),
         "auto_sub_enabled": bool(cfg.get("auto_sub_enabled", True)),
+        "auto_sub_only_broadcast_chats": bool(cfg.get("auto_sub_only_broadcast_chats", True)),
         "log_errors_only": bool(cfg.get("log_errors_only", True)),
         "username": username,
     }
@@ -683,7 +754,7 @@ async def _run(client, phone: str, password_2fa: str) -> None:
                 pass
 
 
-def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_val, callback):
+def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_val, callback, session_id_val=""):
     """Заблокировать вызвавший поток на всё время работы бота."""
     global _client, _loop, _is_running, _callback, _started_at, _user_name, _next_due_ms
 
@@ -704,6 +775,7 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
         if not api_id or not api_hash:
             raise ValueError("api_id и api_hash не заполнены")
         _ensure_storage(app_dir)
+        session_base = _session_name(app_dir, session_id_val, phone)
     except Exception as exc:
         error = "%s: %s" % (type(exc).__name__, exc)
         log_line("ERROR", "Запуск невозможен: %s" % error)
@@ -714,7 +786,7 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     client = TelegramClient(
-        os.path.join(app_dir, SESSION_NAME),
+        os.path.join(app_dir, session_base),
         api_id,
         api_hash,
         catch_up=False,
@@ -793,11 +865,17 @@ def next_due_ms() -> Optional[int]:
     return _next_due_ms
 
 
-def get_tasks_json() -> str:
+def get_tasks_json(app_dir: str = "") -> str:
     """Шаблоны и активные задачи рассылок (только чтение)."""
     templates: List[Dict[str, Any]] = []
     tasks: List[Dict[str, Any]] = []
     db = getattr(bot, "db", None)
+    if db is None and app_dir:
+        try:
+            _ensure_storage(str(app_dir).strip())
+            db = getattr(bot, "db", None)
+        except Exception as exc:
+            log_line("WARN", "Хранилище не инициализировалось: %s" % exc)
     if db is None:
         return json.dumps({"templates": [], "tasks": [], "ready": False}, ensure_ascii=False)
 
@@ -816,19 +894,28 @@ def get_tasks_json() -> str:
         except Exception as exc:
             log_line("WARN", "Шаблоны не прочитались: %s" % exc)
 
-    task_lister = getattr(db, "get_active_interval_tasks", None)
+    now = time.time()
+    account_id = _active_account_id()
+    all_lister = getattr(db, "list_all_tasks", None)
+    task_lister = all_lister if callable(all_lister) else getattr(db, "get_active_interval_tasks", None)
     if callable(task_lister):
         try:
-            for item in task_lister(account_id=0) or []:
+            rows = task_lister(account_id=account_id) or []
+            for item in rows:
                 if not isinstance(item, dict):
                     continue
+                if "is_active" in item and not int(item.get("is_active") or 0):
+                    continue
+                due = _task_next_at(item, now)
                 tasks.append({
                     "id": int(item.get("id") or 0),
                     "chat_id": int(item.get("chat_id") or 0),
                     "template": str(item.get("template_name") or item.get("name") or ""),
                     "mode": str(item.get("mode") or "interval"),
-                    "count": int(item.get("count") or 0),
-                    "next_at": float(_num(item.get("next_at")) or 0.0),
+                    "count": int(item.get("current_count") if item.get("current_count") is not None else (item.get("count") or 0)),
+                    "threshold": int(item.get("counter_threshold") or 0),
+                    "interval": int(item.get("interval_seconds") or 0),
+                    "next_at": float(due or 0.0),
                 })
         except Exception as exc:
             log_line("WARN", "Задачи рассылок не прочитались: %s" % exc)

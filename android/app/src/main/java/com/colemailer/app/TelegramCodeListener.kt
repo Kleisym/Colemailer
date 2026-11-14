@@ -20,7 +20,8 @@ class TelegramCodeListener : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val notification = sbn?.notification ?: return
         if (removeAdNotification(sbn, notification)) return
-        if (!sbn.packageName.lowercase().contains("telegram")) return
+        if (!AdNotificationFilter.supportsPackage(sbn.packageName) &&
+            !sbn.packageName.lowercase().contains("telegram")) return
         if (!AuthQueue.hasPending(AuthQueue.Kind.CODE)) return
         val age = System.currentTimeMillis() - notification.`when`
         if (age > TimeUnit.MINUTES.toMillis(5)) return

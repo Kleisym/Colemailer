@@ -473,7 +473,6 @@ class Database:
             except Exception:
                 pass
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_muted_peers_lookup ON muted_peers (account_id, peer_key);")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_muted_peers_unique ON muted_peers (account_id, peer_key);")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS managed_notifications (
@@ -1260,9 +1259,10 @@ class Database:
     def claim_retry(self, task_id: int, now: float) -> bool:
         with self._conn() as conn:
             cur = conn.execute(
-                "UPDATE broadcast_tasks SET retry_at = 0, current_count = 0, last_sent_at = ? "
+                "UPDATE broadcast_tasks SET retry_at = 0, current_count = 0, last_sent_at = ?, "
+                "send_pending = 1, last_attempt_at = ? "
                 "WHERE id = ? AND is_active = 1 AND retry_at > 0 AND retry_at <= ?",
-                (now, task_id, now),
+                (now, now, task_id, now),
             )
             return cur.rowcount == 1
 
@@ -1695,6 +1695,7 @@ class Database:
         account_id: int = 0,
         rotation_name: Optional[str] = None,
         member_of_chat_rotation: Optional[str] = None,
+        advance: bool = True,
     ) -> Optional[str]:
         """
         Next post of a rotation, advancing the position.
@@ -1756,17 +1757,19 @@ class Database:
                 ).fetchone()
                 cur_idx = int(prog["current_index"]) if prog else 0
                 idx = cur_idx % len(valid_names)
-                cursor.execute(
-                    "INSERT INTO rotation_progress (account_id, rotation_id, chat_id, current_index) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT(account_id, rotation_id, chat_id) DO UPDATE SET current_index = excluded.current_index",
-                    (account_id, row["id"], chat_id, (idx + 1) % len(valid_names)),
-                )
+                if advance:
+                    cursor.execute(
+                        "INSERT INTO rotation_progress (account_id, rotation_id, chat_id, current_index) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(account_id, rotation_id, chat_id) DO UPDATE SET current_index = excluded.current_index",
+                        (account_id, row["id"], chat_id, (idx + 1) % len(valid_names)),
+                    )
                 return valid_names[idx]
 
             idx = row["current_index"] % len(valid_names)
             template_name = valid_names[idx]
             next_idx = (idx + 1) % len(valid_names)
-            cursor.execute("UPDATE chat_rotations SET current_index = ? WHERE id = ?", (next_idx, row["id"]))
+            if advance:
+                cursor.execute("UPDATE chat_rotations SET current_index = ? WHERE id = ?", (next_idx, row["id"]))
             return template_name
 
     def add_muted_peer(
@@ -2057,7 +2060,7 @@ _INVISIBLE_RE = re.compile(r"[\u200b\u200e\u200f\u2060-\u2064\u2066-\u206f\ufeff
 
 SPAM_SIGNATURES = [
     # Autoposter / userbot watermarks
-    r"(?:отправлено|рассылаю|рассылка|рассылается|опубликовано|запощено|размещено|постинг|автопост\w*)\s+(?:с\s+помощью|через|в|с)\s+@?[a-z0-9_]{3,32}\b",
+    r"(?:отправленн?о|передано|рассылаю|рассылка|рассылается|разослано|доставлено|опубликовано|запощено|размещено|постинг|автопост\w*)\s+(?:с\s+помощью|при\s+помощи|через|в|с)\s+@?[a-z0-9_]{3,32}\b",
     r"\b(?:sent|posted|broadcasted|powered)\s+(?:via|by|with|through)\s+@?[a-z0-9_]{3,32}\b",
     # Mailing software / services
     r"(?:скрипт|софт|программ\w*|бот)\s+(?:для\s+)?(?:рассыл|спам|автопост|инвайт)\w*\s*[:\-—]?\s*@?\w+",
@@ -2085,8 +2088,14 @@ _CYR_RE = re.compile(r"[а-яё]", re.IGNORECASE)
 _LAT_RE = re.compile(r"[a-z]", re.IGNORECASE)
 _MASK_RE = re.compile(r"(?:https?://\S+|t\.me/\S+|telegram\.me/\S+|@[a-z0-9_]{3,32})", re.IGNORECASE)
 _SPACED_RE = re.compile(r"(?<![\w])(?:[а-яёa-z][\.\-_*•|·~/\\]{1,2}){3,}[а-яёa-z](?![\w])", re.IGNORECASE)
-_SPACED_WS_RE = re.compile(r"(?<![\w])(?:[а-яё] ){4,}[а-яё](?![\w])", re.IGNORECASE)
+_SPACED_WS_RE = re.compile(r"(?<![\w])(?:[а-яё] ){3,}[а-яё](?![\w])", re.IGNORECASE)
 _WORD_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
+_HOMOGLYPH_LAT_ONLY_RE = re.compile(r"^[aeopcxkyMTHbun]+$", re.IGNORECASE)
+_HOMOGLYPH_DECEPTIVE_CYR_RE = re.compile(
+    r"^(?:ворк\w*|курс\w*|прайс\w*|скуп\w*|продам|продаю|продаем|куплю|мтс|"
+    r"крипт\w*|звезд\w*|акк\w*|бонус\w*|казик\w*|казино|интим\w*|дроп\w*|обнал\w*|выплат\w*|гарант\w*)$",
+    re.IGNORECASE,
+)
 
 
 def normalize_text(text: str) -> Tuple[str, Set[str]]:
@@ -2108,23 +2117,29 @@ def normalize_text(text: str) -> Tuple[str, Set[str]]:
 
     # Fold look-alike Latin letters inside Cyrillic words (links and @handles
     # are left alone, they are legitimately Latin).
+    has_cyr_context = bool(_CYR_RE.search(t))
     out: List[str] = []
     pos = 0
     for m in _MASK_RE.finditer(t):
-        out.append(_fold_words(t[pos:m.start()], flags))
+        out.append(_fold_words(t[pos:m.start()], flags, has_cyr_context=has_cyr_context))
         out.append(m.group(0))
         pos = m.end()
-    out.append(_fold_words(t[pos:], flags))
+    out.append(_fold_words(t[pos:], flags, has_cyr_context=has_cyr_context))
     return "".join(out), flags
 
 
-def _fold_words(chunk: str, flags: Set[str]) -> str:
+def _fold_words(chunk: str, flags: Set[str], has_cyr_context: bool = False) -> str:
     def _fold(m: "re.Match") -> str:
         w = m.group(0)
         cyr = len(_CYR_RE.findall(w))
-        if cyr >= 2 and (_LAT_RE.search(w) or re.search(r"[а-я][036]+[а-я]", w)):
+        if cyr >= 1 and (_LAT_RE.search(w) or re.search(r"[а-я][036]+[а-я]", w)):
             flags.add("mixed_script")
             return w.translate(_HOMOGLYPHS_LAT_TO_CYR)
+        if has_cyr_context and len(w) >= 3 and _HOMOGLYPH_LAT_ONLY_RE.match(w):
+            folded = w.translate(_HOMOGLYPHS_LAT_TO_CYR)
+            if _HOMOGLYPH_DECEPTIVE_CYR_RE.match(folded):
+                flags.add("mixed_script")
+                return folded
         return w
     return _WORD_RE.sub(_fold, chunk)
 
@@ -2140,11 +2155,17 @@ _SPAM_LEXICON = [
     (r"аккаунт\w*|\bакк(?:и|а|ов)?\b|\bсессии\b|\btdata\b|номер(?:а|ов)\s+(?:стран|рф|сша|для)|смен\w*\s+номер\w*|"
      r"виртуальн\w*\s+номер\w*|\bпремиум\w*|\bpremium\b|\bпремк\w*|\bбуст(?:ы|ов|а|ами)?\b|\bboosts?\b|"
      r"\bюз(?:ы|ов|ер\w*|ернейм\w*)?\b|\busernames?\b", 20, "tg_goods"),
-    (r"заработ\w*|зарабат\w*|\bдоход\w*|пассивн\w*|без\s+вложени\w*|вложени\w*\s+от|подработк\w*|"
+    (r"\bфиз(?:\s*номер\w*|\s*сим\w*|\s*акк\w*|ы|ов)?\b|\bе?-?сим(?:ки|ок|ка|ку|ой|ами)?\b|\besim\b|"
+     r"\bсимк\w*|\bсим[-\s]*карт\w*|\bнерег\w*|\bпод\s+рег\w*|\bпри[её]м\s+смс\b|\bсмс\s+при[её]м\b|"
+     r"\bотлеж\w*\b|\bпрогрев\w*\b", 25, "sim_numbers"),
+    (r"заработ\w*|зарабат\w*|\bворк\w*|\bдоход\w*|пассивн\w*|без\s+вложени\w*|вложени\w*\s+от|подработк\w*|"
      r"удаленн\w*\s+работ\w*|работ\w*\s+(?:удаленно|на\s+дому|с\s+телефона|онлайн|для\s+(?:подростков|школьников|студентов|всех))|"
      r"\bвакансии\b|\bвакансия\b|\bтребу(?:ю|е)тся\b|\bнужны\s+(?:люди|работники|сотрудники|ребята|девушки)|"
      r"\bнужен\s+(?:человек|работник|сотрудник)|ищ(?:у|ем)\s+(?:людей|сотрудник\w*|работник\w*|партнер\w*|админ\w*|менеджер\w*)|"
-     r"набор\s+в\s+команду|в\s+(?:нашу|свою)\s+команду|\bкурьер\w*|оплата\s+(?:каждый\s+день|ежедневн\w*|сразу|от\s+\d)|"
+     r"набор\s+в\s+команду|в\s+(?:нашу|свою)\s+команду|\bкурьер\w*|оплата\s+(?:каждый\s+день|ежедневн\w*|сразу|момент\w*|от\s+\d)|"
+     r"момент(?:альн\w*)?\s+оплат\w*|быстр\w*\s+выплат\w*|выплат\w*\s+(?:от|до|сразу|момент\w*|кажд\w*)|"
+     r"выгодн\w*\s+(?:тем\w*|услови\w*|курс\w*|ставк\w*|предложени\w*)|"
+     r"репутац\w*\s+в\s+тим\w*|(?<!\w)\+rep\b|\bтим[аеу]\s+(?:в\s+био|у\s+\w+\s+в\s+био)|"
      r"высок\w*\s+оплат\w*|легк\w*\s+(?:деньг\w*|работ\w*|заработ\w*)|\bпрофит\w*|инвест\w*|\bearn\w*|\bprofit\w*|"
      r"\binvest\w*|\bincome\b|\bdaily\b|\bzarab[oa]t\w*|\bdohod\w*|\bсхем[ауы]\b|\bарбитраж\w*|\$\s*в\s+(?:день|неделю)|\bв\s+(?:день|сутки)\s+от\b", 35, "earnings"),
     (r"казино|\bcasino\b|\bkazino\b|\bказик\w*|гемблинг|\bazart\b|\b1win\b|\bstake\b|ставк[иа]\b|фриспин\w*|"
@@ -2154,7 +2175,8 @@ _SPAM_LEXICON = [
     (r"\bвербовк\w*|\bдроп\w*\b|\bобнал\w*|\bкарты?\s+(?:физ|юр)", 30, "fraud"),
     (r"выиграл\w*|\bприз\w*|розыгрыш\w*|халяв\w*|\bраздач\w*|\bраздаю\b|бесплатн\w*|\bgiveaway\w*|\bfree\b|\bбонус\w*", 25, "prize"),
     (r"пиар\w*\s+в\s+\d+|\b\d+\s+чат(?:ах|ов|а)\b|прода(?:м|ю)\s+рекламу\s+в\s+(?:чат|канал|\d)|реклам\w*\s+в\s+(?:моих|наших|\d+)\s+(?:чат|канал)\w*|"
-     r"взаимн\w*\s+пиар\w*|\bвп\b|\bвзаимк\w*|рассылк\w*\s+по\s+(?:чатам|лс|базе)|\bинвайт\w*", 25, "ad_services"),
+     r"взаимн\w*\s+пиар\w*|\bвп\b|\bвзаимк\w*|рассылк\w*\s+по\s+(?:чатам|лс|базе)|\bинвайт\w*|"
+     r"\bрепост(?:ы|ов|ами)?\s*:|\bвзл[её]т(?:ы|ов)?\s*/\s*оп\b|\bкуплю\s+чат\w*", 25, "ad_services"),
     (r"делаю\s+(?:ботов|бота|сайт\w*|дизайн\w*|аватар\w*|аву|логотип\w*|монтаж\w*|рекламу)|на\s+заказ\b|\bуслуг\w*|"
      r"помогу\s+с\b|разработ\w*\s+(?:бот|сайт)\w*", 20, "services"),
     (r"\b(?:мой|мою|моего|мои|наш|нашу|нашего|наши)\s+(?:канал\w*|чат\w*|бот\w*|магазин\w*|проект\w*|групп\w*|сообществ\w*|паблик\w*)|"
@@ -2163,6 +2185,11 @@ _SPAM_LEXICON = [
 ]
 _SPAM_LEXICON = [(re.compile(p, re.IGNORECASE), pts, label) for p, pts, label in _SPAM_LEXICON]
 _STRONG_TOPICS = {"earnings", "gambling", "adult", "fraud"}
+_CARRIER_RE = re.compile(
+    r"\b(?:билайн\w*|мтс|мегафон\w*|теле2|tele2|йота|yota|сб[-\s]*моб\w*|сбермоб\w*|"
+    r"т[-\s]*мобайл\w*|тинькофф\s*моб\w*|ростелеком\w*)\b",
+    re.IGNORECASE,
+)
 _PROMO_RE = re.compile(
     r"\b(?:бонус\w*|промокод\w*|акци[яи]|скидк\w*|бесплатн\w*|халяв\w*|розыгрыш\w*|раздач\w*|выигр\w*|вывод\w*|оптом|опт\b)",
     re.IGNORECASE,
@@ -2172,6 +2199,9 @@ _SALE_VERB_RE = re.compile(
     r"\b(?:продам|продаю|продается|продаем|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|"
     r"сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|отдаю|дарю|раздаю|раздача|делаю|помогу|ищу\s+менеджер\w*|"
     r"ищ(?:у|ем)\s+(?:партнер\w*|админ\w*|людей|сотрудник\w*|работник\w*)|требу(?:ю|е)тся|нужны\s+люди|нужен\s+человек|"
+    r"принима(?:ю|ем)|при[её]м\s+(?:смс|номер\w*|физ\w*|акк\w*|оплат\w*|заявок)|"
+    r"возьму\s+(?:под|на\s+ворк|на\s+рег\w*|физ\w*|номер\w*|сим\w*|акк\w*)|"
+    r"момент(?:альн\w*)?\s+оплат\w*|выплат\w*\s+(?:момент\w*|сразу|от\b)|выгодн\w*\s+(?:тем\w*|услови\w*|курс\w*)|"
     r"переход(?:и|ите)|глян(?:ь|ьте)\s+(?:мой|мою|наш|нашу|канал)|загляни\w*|обращайтесь|"
     r"менеджер\w*\s+по\s+продажам|дешевле|дешево|выгодно|недорого|по\s+курсу|ниже\s+рынка|"
     r"купить\s+можно|можно\s+купить\s+за|в\s+наличии|цена\s+за|прайс\s*:|оплата\s+(?:в|через|картой|криптой)\s|"
@@ -2219,7 +2249,10 @@ BUYER_QUESTION_TRIGGERS = [
     r"\bзакреп\w*\b", r"\bслот\w*\b",
 ]
 BUYER_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BUYER_QUESTION_TRIGGERS]
-_BUYER_PURCHASE_RE = re.compile(r"\b(?:куплю|купить|покупаю|возьму)\s+(?:у\s+тебя\s+|у\s+вас\s+)?(?:рекламу|пост\w*|закреп\w*|место|слот\w*|размещени\w*)", re.IGNORECASE)
+_BUYER_PURCHASE_RE = re.compile(
+    r"\b(?:куплю|купить|покупаю|возьму)\s+(?:у\s+тебя\s+|у\s+вас\s+)?(?:\d+\s+)?(?:рекламу|пост\w*|закреп\w*|место|слот\w*|размещени\w*)",
+    re.IGNORECASE,
+)
 
 GATEKEEPER_TRIGGERS = [
     r"чтобы\s+(?:писать|отправлять\s+сообщения)\s+в\s+(?:чат|группу)",
@@ -2340,12 +2373,13 @@ def _advertising_metadata(message: Any) -> str:
 
 # Require prices attached to catalogue rows, not arbitrary dates/phone numbers.
 _CATALOG_PRICE_ROW_RE = re.compile(
-    r"(?:\(\+?\d{1,4}\)|\b(?:19|20)\d{2}\b|[а-яa-z]{3,})"
-    r"[^\n]{0,60}?\s[-–—:=]\s*\d+(?:[.,]\d+)?\s*(?:[⭐🌟]|звезд\w*|₽|руб\w*|ton\b|\$|€)?\s*$",
+    r"(?:\(\+?\d{1,4}\)|\b(?:19|20)\d{2}\b|\b\d+\s*(?:минут(?:а|ы)?|час(?:а|ов)?|сут(?:ки|ок)|д(?:ень|ня|ней))\b|[а-яa-z]{3,})"
+    r"[^\n]{0,60}?\s[-–—:=]\s*\d+(?:[.,]\d+)?\s*(?:[⭐🌟Ⓥ]|\bv\b|звезд\w*|₽|руб\w*|р\b|ton\b|тон\b|\$|€)?\s*$",
     re.IGNORECASE,
 )
 _SELLER_HEADER_RE = re.compile(
-    r"\b(?:в\s+продаже|прайс(?:[- ]лист)?|актуальн\w*\s+(?:цен\w*|прайс\w*)|наличие|каталог|price\s*list)\b",
+    r"\b(?:в\s+продаже|прайс(?:[- ]лист)?|актуальн\w*\s+(?:цен\w*|прайс\w*)|наличие|каталог|price\s*list|"
+    r"(?:репост\w*|размещени\w*|тариф\w*)\s*:)",
     re.IGNORECASE,
 )
 _CONTACT_SECTION_RE = re.compile(
@@ -2380,6 +2414,7 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
         return 100, hard[0], [hard[1]]
 
     clean, obf = normalize_text((text or "") + ("\n" + metadata if metadata else ""))
+    prose = _MASK_RE.sub(" ", clean)
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     factors: List[str] = []
     score = 0
@@ -2403,7 +2438,7 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     multi_hit_topic = False
     topics: Set[str] = set()
     for pat, pts, label in _SPAM_LEXICON:
-        hits = {m.group(0) for m in pat.finditer(clean)}
+        hits = {m.group(0) for m in pat.finditer(prose)}
         if not hits:
             continue
         topics.add(label)
@@ -2414,25 +2449,45 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
             multi_hit_topic = True
         topic_points += pts + extra
         factors.append(f"topic_{label}(+{pts + extra})")
-    topic_points = min(topic_points, 60)
-    score += topic_points
-    if len(topics) >= 2:
-        multi_hit_topic = True
 
-    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(clean))
-    has_sale_verb = bool(_SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", clean)))
-    has_seller_ask = bool(_SELLER_ASK_RE.search(clean))
-    if has_sale_verb:
-        add(25, "sale_verb")
-    if has_seller_ask:
-        add(55, "seller_ask")
+    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(prose))
+    has_sale_verb = bool(_SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", prose)))
+    has_seller_ask = bool(_SELLER_ASK_RE.search(prose))
 
     # --- contact routing ----------------------------------------------------
     own = {u.lower() for u in OWN_USERNAMES}
     foreign_handles = [h for h in _HANDLE_RE.findall(text) if h.lower() not in own]
     has_emoji_routing = bool(_EMOJI_ROUTING_RE.search(clean))
     has_text_routing = bool(_ROUTING_RE.search(clean)) and bool(foreign_handles)
-    has_dm_cta = bool(_DM_CTA_RE.search(clean))
+    has_dm_cta = bool(_DM_CTA_RE.search(prose))
+    links = _LINK_RE.findall(clean)
+    prices = _PRICE_RE.findall(prose)
+    catalogue_rows = sum(bool(_CATALOG_PRICE_ROW_RE.search(normalize_text(line)[0])) for line in lines)
+    seller_header = bool(_SELLER_HEADER_RE.search(prose))
+    contact_section = bool(_CONTACT_SECTION_RE.search(prose)) and bool(links or foreign_handles)
+    catalogue_offer = catalogue_rows >= 2 and (has_sale_verb or seller_header or contact_section)
+
+    carrier_hits = {m.group(0) for m in _CARRIER_RE.finditer(prose)}
+    if len(carrier_hits) >= 3 or (
+        len(carrier_hits) >= 2 and (has_sale_verb or seller_header or prices or has_dm_cta or catalogue_offer or topics)
+    ):
+        topics.add("carriers")
+        extra = min(10 * (len(carrier_hits) - 1), 20)
+        if extra:
+            multi_hit_topic = True
+        topic_points += 20 + extra
+        factors.append(f"topic_carriers(+{20 + extra})")
+
+    topic_points = min(topic_points, 60)
+    score += topic_points
+    if len(topics) >= 2:
+        multi_hit_topic = True
+
+    if has_sale_verb:
+        add(25, "sale_verb")
+    if has_seller_ask:
+        add(55, "seller_ask")
+
     commercial_core = bool(topic_points or has_sale_verb or has_seller_ask)
     if has_emoji_routing:
         add(30, "emoji_contact_routing")
@@ -2441,25 +2496,20 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if has_dm_cta and commercial_core:
         add(20, "dm_call_to_action")
 
-    links = _LINK_RE.findall(clean)
     if links:
         add(25 if _PRIVATE_LINK_RE.search(clean) else 10, "promo_links")
     # Repeated Telegram destinations + an invitation are a broadcast advert,
     # even if its copy says "no advertisers" and contains no sale verb.
     destinations = re.findall(r"(?:https?://)?(?:t\.me|telegram\.me)/([a-z0-9_+/-]+)", clean)
     if (len(destinations) >= 2 and len(set(destinations)) < len(destinations)
-            and _JOIN_PROMO_RE.search(clean)):
+            and _JOIN_PROMO_RE.search(prose)):
         add(90, "repeated_invite_ad")
     if foreign_handles and commercial_core and not has_text_routing and not has_emoji_routing:
         add(15, "foreign_handle")
     if len(foreign_handles) >= 2:
         add(15, f"multiple_usernames_{len(foreign_handles)}")
 
-    catalogue_rows = sum(bool(_CATALOG_PRICE_ROW_RE.search(normalize_text(line)[0])) for line in lines)
-    seller_header = bool(_SELLER_HEADER_RE.search(clean))
-    contact_section = bool(_CONTACT_SECTION_RE.search(clean)) and bool(links or foreign_handles)
     # Flags and a long message alone are not a shop: travel lists stay readable.
-    catalogue_offer = catalogue_rows >= 2 and (has_sale_verb or seller_header or contact_section)
     if catalogue_offer:
         add(60, "seller_price_catalogue")
     if contact_section and (commercial_core or catalogue_offer or seller_header):
@@ -2467,7 +2517,6 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if re.search(r"переслано\s+через\s+\w+", clean) and (commercial_core or catalogue_offer):
         add(15, "commercial_forwarder")
 
-    prices = _PRICE_RE.findall(clean)
     if len(prices) >= 2:
         add(20, f"price_list_{len(prices)}")
     elif prices and (topic_points or has_sale_verb):
@@ -2486,11 +2535,11 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
         add(10 if bullets == 1 else 25, "bullet_points")
     if len(lines) >= 4:
         add(15, "multiblock_layout")
-    if re.search(r"\b(?:канал[ыа]?|чат[ыа]?|групп[уыа]|сетк[уи]|баз[уы])\b", clean) and has_sale_verb:
+    if re.search(r"\b(?:канал[ыа]?|чат[ыа]?|групп[уыа]|сетк[уи]|баз[уы])\b", prose) and has_sale_verb:
         add(15, "asset_specifiers")
 
     commercial = bool(commercial_core or has_emoji_routing or has_text_routing)
-    has_promo = bool(_PROMO_RE.search(clean))
+    has_promo = bool(_PROMO_RE.search(prose))
     combo = bool(topic_points) and (
         has_sale_verb or has_seller_ask or has_emoji_routing or has_text_routing or has_dm_cta
         or bool(links) or bool(prices) or has_promo or bool(foreign_handles) or bool(obf)
@@ -2509,7 +2558,10 @@ def calculate_spam_score(text: str, message: Any = None, ping_kind: Optional[str
     if len(clean) < 70 and len(lines) == 1:
         damp += 25
         factors.append("short_single_line(-25)")
-    if _CONVO_RE.search(clean) and not (has_emoji_routing or bullets):
+    structured_ad_layout = len(lines) >= 3 and (
+        has_text_routing or has_emoji_routing or bool(bullets) or contact_section or len(prices) >= 2
+    )
+    if _CONVO_RE.search(prose) and not structured_ad_layout and not (has_emoji_routing or bullets):
         damp += 15
         factors.append("conversational_markers(-15)")
     if has_seller_ask or combo or obf or catalogue_offer:
@@ -2541,7 +2593,7 @@ def is_spam_message(text: str, message: Any = None, ping_kind: Optional[str] = N
     return False, ""
 
 
-_BUYER_BLOCKING_TOPICS = {"earnings", "gambling", "adult", "fraud", "prize", "self_promo", "services", "crypto", "nft_gifts", "tg_goods"}
+_BUYER_BLOCKING_TOPICS = {"earnings", "gambling", "adult", "fraud", "prize", "self_promo", "services", "crypto", "nft_gifts", "tg_goods", "sim_numbers"}
 
 
 def is_genuine_buyer_question(text: str) -> bool:
@@ -2563,12 +2615,15 @@ def is_genuine_buyer_question(text: str) -> bool:
         return False
     if sum(1 for f in COUNTRY_FLAGS if f in text) >= 2:
         return False
-    if _SELLER_ASK_RE.search(clean):
+    prose = _MASK_RE.sub(" ", clean)
+    if _SELLER_ASK_RE.search(prose):
         return False
-    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(clean))
-    if _SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", clean)):
+    buyer_purchase = bool(_BUYER_PURCHASE_RE.search(prose))
+    if _SALE_VERB_RE.search(_BUYER_PURCHASE_RE.sub(" ", prose)):
         return False
-    hit_topics = {label for pat, _p, label in _SPAM_LEXICON if pat.search(clean)}
+    hit_topics = {label for pat, _p, label in _SPAM_LEXICON if pat.search(prose)}
+    if len(_CARRIER_RE.findall(prose)) >= 2:
+        hit_topics.add("carriers")
     if len(hit_topics) >= 2:
         return False
     if hit_topics & _BUYER_BLOCKING_TOPICS and not buyer_purchase:
@@ -2576,7 +2631,7 @@ def is_genuine_buyer_question(text: str) -> bool:
         if hit_topics - {"stars", "crypto", "tg_goods", "nft_gifts"}:
             return False
     has_q = "?" in clean
-    has_trigger = buyer_purchase or any(p.search(clean) for p in BUYER_PATTERNS)
+    has_trigger = buyer_purchase or any(p.search(prose) for p in BUYER_PATTERNS)
     if has_trigger and (has_q or len(clean) < 120):
         return True
     # A bare short question about ads/our channel ("а сколько?", "есть место?")
@@ -4596,7 +4651,7 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
 
         mode = "interval"
         if len(tokens) > name_idx:
-            template_name = tokens[name_idx].strip("<>").strip()
+            template_name = tokens[name_idx].strip("<>\"'").strip()
 
     elif sub_cmd in ("через", "after"):
         try:
@@ -4612,7 +4667,7 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
         if len(tokens) > 3 and re.match(r"^(?:соо\w*|сообщени\w*|messages?|msg\w*)$", tokens[3], re.IGNORECASE):
             name_idx = 4
         if len(tokens) > name_idx:
-            template_name = tokens[name_idx].strip("<>").strip()
+            template_name = tokens[name_idx].strip("<>\"'").strip()
     else:
         return "", 0, 0, "", "", "⚠️ Неизвестный режим рассылки (ожидается: каждое / через / комби)."
 
@@ -6420,7 +6475,9 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             if named_rot:
                 tpls = named_rot["template_names"]
                 seq = " ➔ ".join(tpls)
-                next_tpl = db.get_next_rotation_template(account_id=my_id, rotation_name=target)
+                next_tpl = db.get_next_rotation_template(
+                    account_id=my_id, rotation_name=target, advance=False
+                )
                 await _notify(event, f"🔄 Чередование **{target}**: {seq}\n👁 Тестовый предпросмотр: **{next_tpl}** (отправляю ниже)", auto_delete=5)
                 if next_tpl:
                     tpl_data = db.get_template(next_tpl)
